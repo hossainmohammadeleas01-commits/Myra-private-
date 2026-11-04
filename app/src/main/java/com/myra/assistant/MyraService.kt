@@ -53,6 +53,9 @@ class MyraService : Service() {
         private const val RECONNECT_MS = 3_000L
 
         @Volatile var running = false
+        @Volatile var speakingNow = false
+        @Volatile var mutedNow = false
+        @Volatile var level = 0f
         /** kind: "u" (user), "m" (myra), "s" (status/system) */
         @Volatile var listener: ((String, String) -> Unit)? = null
         val log = CopyOnWriteArrayList<Pair<String, String>>()
@@ -67,8 +70,12 @@ class MyraService : Service() {
     @Volatile private var ws: WebSocket? = null
     @Volatile private var active = false
     @Volatile private var ready = false
-    @Volatile private var speaking = false
-    @Volatile private var muted = false
+    private var speaking: Boolean
+        get() = speakingNow
+        set(v) { speakingNow = v }
+    private var muted: Boolean
+        get() = mutedNow
+        set(v) { mutedNow = v }
     @Volatile private var lastSend = 0L
     private var greeted = false
     private var fails = 0
@@ -196,6 +203,9 @@ class MyraService : Service() {
                 val r = record ?: break
                 val n = try { r.read(buf, 0, buf.size) } catch (_: Exception) { -1 }
                 if (n <= 0) continue
+                var sum = 0.0
+                for (i in 0 until n) sum += buf[i].toDouble() * buf[i].toDouble()
+                level = minOf(1f, (Math.sqrt(sum / n) / 32768.0 * 6.0).toFloat())
                 if (!ready || muted || speaking) continue
                 sendPcm(buf, n)
             }
