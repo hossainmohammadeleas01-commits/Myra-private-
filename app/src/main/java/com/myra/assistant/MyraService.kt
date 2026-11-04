@@ -6,9 +6,11 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
@@ -21,7 +23,10 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.provider.CallLog
 import android.provider.ContactsContract
+import android.provider.MediaStore
+import android.telephony.SmsManager
 import android.util.Base64
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -31,9 +36,12 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -81,6 +89,7 @@ class MyraService : Service() {
     private var fails = 0
     private var inBuf = StringBuilder()
     private var outBuf = StringBuilder()
+    private val links = LinkedHashSet<String>()
 
     private var record: AudioRecord? = null
     private var track: AudioTrack? = null
@@ -96,7 +105,7 @@ class MyraService : Service() {
             ACTION_STOP -> { stopAll(); return START_NOT_STICKY }
             ACTION_MUTE -> {
                 muted = !muted
-                emit("s", if (muted) "Mic muted 🔇" else "Mic on 🎤")
+                emit("s", if (muted) "Mic muted 🔇" else "Listening... 🎤")
                 updateNotification()
             }
             else -> startAll()
@@ -141,7 +150,7 @@ class MyraService : Service() {
 
     private fun stopAll() {
         if (!active && !running) return
-        active = false; running = false; ready = false; speaking = false
+        active = false; running = false; ready = false; speaking = false; muted = false; level = 0f
         handler.removeCallbacksAndMessages(null)
         val w = ws; ws = null
         try { w?.close(1000, "bye") } catch (_: Exception) {}
@@ -299,6 +308,37 @@ class MyraService : Service() {
         }
     }
 
+    private fun fn(name: String, desc: String, vararg params: String): JSONObject {
+        val o = JSONObject().put("name", name).put("description", desc)
+        if (params.isNotEmpty()) {
+            val props = JSONObject()
+            params.forEach { props.put(it, JSONObject().put("type", "STRING")) }
+            o.put(
+                "parameters",
+                JSONObject().put("type", "OBJECT").put("properties", props)
+                    .put("required", JSONArray(params.toList()))
+            )
+        }
+        return o
+    }
+
+    private fun toolsJson(): JSONArray {
+        val decls = JSONArray()
+            .put(fn("open_app", "Open an installed app on the phone by its name, e.g. youtube, whatsapp, camera", "name"))
+            .put(fn("call_contact", "Make a phone call to a contact name or a phone number", "name_or_number"))
+            .put(fn("get_recent_calls", "Get the user's recent call log (last 10 calls with names, numbers, type and time)"))
+            .put(fn("send_sms", "Send an SMS text message to a contact name or number", "to", "message"))
+            .put(fn("send_whatsapp", "Send a WhatsApp message to a contact name or number", "to", "message"))
+            .put(fn("open_url", "Open a web page in the browser. Pass a full URL, or a search phrase to open a Google search", "url"))
+            .put(fn("look_at_screen", "Take a screenshot of what is currently on the phone screen and look at it, to read it, explain it or solve a problem shown on it", "question"))
+            .put(fn("share_screenshot", "Take a screenshot and open the share sheet. app can be whatsapp, telegram, gmail or empty", "app"))
+            .put(fn("go_home", "Go to the phone home screen"))
+            .put(fn("stop_assistant", "Shut down the MYRA assistant when the user says stop, goodbye or band karo"))
+        return JSONArray()
+            .put(JSONObject().put("googleSearch", JSONObject()))
+            .put(JSONObject().put("functionDeclarations", decls))
+    }
+
     private fun buildSetup(): String {
         val model = prefs.getString("model", "models/gemini-2.5-flash-native-audio-preview-12-2025")
         val voice = prefs.getString("voice", "Aoede")
@@ -319,6 +359,7 @@ class MyraService : Service() {
                 JSONObject().put("parts", JSONArray().put(JSONObject().put("text", systemPrompt())))
             )
             .put("generationConfig", gen)
+            .put("tools", toolsJson())
             .put("outputAudioTranscription", JSONObject())
             .put("inputAudioTranscription", JSONObject())
         return JSONObject().put("setup", setup).toString()
@@ -334,7 +375,11 @@ class MyraService : Service() {
         }
         return "$persona\nCurrent date/time: ${Date()}.\nThe user's name is $name.\n" +
             "You are speaking ALOUD — keep responses natural and conversational.\n" +
-            "When the user asks to open an app or call someone, the phone does it automatically; just confirm briefly."
+            "You control the user's phone through functions. Whenever the user asks to open an app, call or message someone, " +
+            "see their call history, look at/read/solve what is on their screen, share a screenshot or open a web page, " +
+            "CALL the matching function instead of only talking, then confirm briefly after it returns. " +
+            "For questions needing current information, use Google Search. If the user wants a link/page, use open_url. " +
+            "For send_sms and send_whatsapp, if the message text is missing, ask the user what to write first."
     }
 
     private fun greeting(): String {
@@ -368,6 +413,7 @@ class MyraService : Service() {
             if (!greeted) { greeted = true; handler.postDelayed({ sendText(greeting()) }, 400) }
             return
         }
+        m.optJSONObject("toolCall")?.let { handleToolCall(it); return }
         val sc = m.optJSONObject("serverContent") ?: return
         if (sc.optBoolean("interrupted")) interruptPlayback()
         val parts = sc.optJSONObject("modelTurn")?.optJSONArray("parts")
@@ -380,54 +426,250 @@ class MyraService : Service() {
                 }
             }
         }
+        sc.optJSONObject("groundingMetadata")?.optJSONArray("groundingChunks")?.let { arr ->
+            for (i in 0 until minOf(arr.length(), 3)) {
+                val w = arr.optJSONObject(i)?.optJSONObject("web")
+                if (w != null) {
+                    val uri = w.optString("uri")
+                    if (uri.isNotEmpty()) links.add("${w.optString("title")}\n$uri")
+                }
+            }
+        }
         sc.optJSONObject("outputTranscription")?.optString("text")?.let { outBuf.append(it) }
         sc.optJSONObject("inputTranscription")?.optString("text")?.let { inBuf.append(it) }
         if (sc.optBoolean("turnComplete")) {
             val u = inBuf.toString().trim(); val a = outBuf.toString().trim()
             inBuf = StringBuilder(); outBuf = StringBuilder()
-            if (u.isNotEmpty()) { emit("u", u); handler.post { runCommand(u) } }
+            if (u.isNotEmpty()) {
+                emit("u", u)
+                val l = u.lowercase()
+                if (l.contains("stop myra") || l.contains("myra band")) { handler.post { stopAll() }; return }
+            }
             if (a.isNotEmpty()) emit("m", a)
+            if (links.isNotEmpty()) {
+                emit("m", "🔗 Sources:\n" + links.joinToString("\n\n"))
+                links.clear()
+            }
         }
     }
 
-    // ---------------------------------------------------------------- commands
+    // ---------------------------------------------------------------- tools (function calling)
 
-    private fun runCommand(raw: String) {
-        val t = raw.lowercase().replace(Regex("[.,!?]"), " ").replace(Regex("\\s+"), " ").trim()
-        if (t.contains("stop myra") || t.contains("myra band") || t.contains("band ho jao")) {
-            stopAll(); return
-        }
-        val call = Regex("(?:call|phone|dial)\\s+(?:karo\\s+)?(.+)").find(t)
-            ?: Regex("(.+?)\\s+ko\\s+(?:call|phone)").find(t)
-        if (call != null) {
-            val who = call.groupValues[1].replace(Regex("\\b(karo|kar do|please|my)\\b"), "").trim()
-            val number = resolveNumber(who)
-            if (number != null) {
-                if (checkSelfPermission(Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED) {
-                    launch(Intent(Intent.ACTION_CALL, Uri.parse("tel:$number")))
-                    emit("s", "📞 Calling $who")
-                } else emit("s", "CALL permission দাও")
-            } else emit("s", "'$who' এর নম্বর পাইনি")
-            return
-        }
-        val open = Regex("(?:open|launch)\\s+(.+)").find(t)
-            ?: Regex("(.+?)\\s+(?:kholo|khol do|open karo|chalu karo|chalao)").find(t)
-        if (open != null) {
-            val app = open.groupValues[1].replace(Regex("\\b(the|app|karo)\\b"), "").trim()
-            openApp(app)
+    private fun handleToolCall(tc: JSONObject) {
+        val calls = tc.optJSONArray("functionCalls") ?: return
+        for (i in 0 until calls.length()) {
+            val c = calls.getJSONObject(i)
+            val id = c.optString("id")
+            val name = c.optString("name")
+            val args = c.optJSONObject("args") ?: JSONObject()
+            handler.post {
+                try { executeTool(id, name, args) }
+                catch (e: Exception) { respond(id, name, "Error: ${e.message}") }
+            }
         }
     }
 
-    private fun openApp(name: String) {
+    private fun respond(id: String, name: String, result: String) {
+        val r = JSONObject().put(
+            "toolResponse", JSONObject().put(
+                "functionResponses", JSONArray().put(
+                    JSONObject().put("id", id).put("name", name)
+                        .put("response", JSONObject().put("result", result))
+                )
+            )
+        )
+        ws?.send(r.toString())
+    }
+
+    private fun executeTool(id: String, name: String, a: JSONObject) {
+        when (name) {
+            "open_app" -> respond(id, name, openApp(a.optString("name").lowercase().trim()))
+            "call_contact" -> respond(id, name, callContact(a.optString("name_or_number").lowercase().trim()))
+            "get_recent_calls" -> respond(id, name, recentCalls())
+            "send_sms" -> respond(id, name, sendSms(a.optString("to").lowercase().trim(), a.optString("message")))
+            "send_whatsapp" -> respond(id, name, sendWhatsapp(a.optString("to").lowercase().trim(), a.optString("message")))
+            "open_url" -> respond(id, name, openUrl(a.optString("url").trim()))
+            "look_at_screen" -> lookAtScreen(id, name, a.optString("question"))
+            "share_screenshot" -> shareScreenshot(id, name, a.optString("app"))
+            "go_home" -> {
+                val svc = MyraAccessibilityService.instance
+                if (svc != null) svc.home()
+                else launch(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME))
+                respond(id, name, "Went to home screen")
+            }
+            "stop_assistant" -> {
+                respond(id, name, "Stopping")
+                handler.postDelayed({ stopAll() }, 2500)
+            }
+            else -> respond(id, name, "Unknown function $name")
+        }
+    }
+
+    private fun openApp(name: String): String {
         val pm = packageManager
         val main = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         val hit = pm.queryIntentActivities(main, 0)
             .firstOrNull { it.loadLabel(pm).toString().lowercase().contains(name) }
-        val launch = hit?.let { pm.getLaunchIntentForPackage(it.activityInfo.packageName) }
-        if (launch != null) {
-            launch(launch)
+        val li = hit?.let { pm.getLaunchIntentForPackage(it.activityInfo.packageName) }
+        return if (li != null) {
+            launch(li)
             emit("s", "📱 Opening $name")
-        } else emit("s", "'$name' অ্যাপ পাইনি")
+            "Opened $name"
+        } else "App '$name' not found on this phone"
+    }
+
+    private fun callContact(who: String): String {
+        val number = resolveNumber(who) ?: return "No phone number found for '$who'"
+        if (checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED)
+            return "CALL_PHONE permission not granted"
+        launch(Intent(Intent.ACTION_CALL, Uri.parse("tel:$number")))
+        emit("s", "📞 Calling $who")
+        return "Calling $who ($number)"
+    }
+
+    private fun recentCalls(): String {
+        if (checkSelfPermission(Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED)
+            return "READ_CALL_LOG permission not granted"
+        val sb = StringBuilder()
+        val fmt = SimpleDateFormat("dd MMM HH:mm", Locale.getDefault())
+        try {
+            contentResolver.query(
+                CallLog.Calls.CONTENT_URI,
+                arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.CACHED_NAME, CallLog.Calls.TYPE, CallLog.Calls.DATE),
+                null, null, CallLog.Calls.DATE + " DESC"
+            )?.use { c ->
+                var n = 0
+                while (c.moveToNext() && n < 10) {
+                    val type = when (c.getInt(2)) {
+                        CallLog.Calls.INCOMING_TYPE -> "incoming"
+                        CallLog.Calls.OUTGOING_TYPE -> "outgoing"
+                        CallLog.Calls.MISSED_TYPE -> "missed"
+                        else -> "other"
+                    }
+                    val nm = c.getString(1) ?: "Unknown"
+                    sb.append("${n + 1}. $nm (${c.getString(0)}) $type ${fmt.format(Date(c.getLong(3)))}\n")
+                    n++
+                }
+            }
+        } catch (e: Exception) { return "Could not read call log: ${e.message}" }
+        return if (sb.isEmpty()) "No calls found" else sb.toString()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun smsManager(): SmsManager =
+        if (Build.VERSION.SDK_INT >= 31) getSystemService(SmsManager::class.java) else SmsManager.getDefault()
+
+    private fun sendSms(to: String, msg: String): String {
+        if (msg.isBlank()) return "Message text is empty"
+        if (checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED)
+            return "SEND_SMS permission not granted"
+        val num = resolveNumber(to) ?: return "No phone number found for '$to'"
+        return try {
+            val sm = smsManager()
+            sm.sendMultipartTextMessage(num, null, sm.divideMessage(msg), null, null)
+            emit("s", "✉ SMS sent to $to")
+            "SMS sent to $to ($num)"
+        } catch (e: Exception) { "SMS failed: ${e.message}" }
+    }
+
+    private fun sendWhatsapp(to: String, msg: String): String {
+        if (msg.isBlank()) return "Message text is empty"
+        var num = resolveNumber(to) ?: return "No phone number found for '$to'"
+        num = num.replace(Regex("[^\\d+]"), "")
+        val cc = prefs.getString("cc", "")?.trim().orEmpty()
+        if (num.startsWith("0") && cc.isNotEmpty()) num = cc + num.drop(1)
+        num = num.replace("+", "")
+        val url = "https://wa.me/$num?text=${Uri.encode(msg)}"
+        launch(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        val acc = MyraAccessibilityService.instance
+        if (acc != null) handler.postDelayed({ acc.clickSend() }, 4000)
+        emit("s", "💬 WhatsApp → $to")
+        return if (acc != null) "WhatsApp opened for $to and the send button will be tapped automatically"
+        else "WhatsApp opened with the message for $to; the user must tap send (accessibility is off)"
+    }
+
+    private fun openUrl(u: String): String {
+        val url = when {
+            u.startsWith("http://") || u.startsWith("https://") -> u
+            u.contains(".") && !u.contains(" ") -> "https://$u"
+            else -> "https://www.google.com/search?q=" + Uri.encode(u)
+        }
+        launch(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        emit("s", "🌐 $url")
+        return "Opened $url"
+    }
+
+    private fun bitmapToB64(bmp: Bitmap): String {
+        val scale = 1600f / maxOf(bmp.width, bmp.height)
+        val b = if (scale < 1f)
+            Bitmap.createScaledBitmap(bmp, (bmp.width * scale).toInt(), (bmp.height * scale).toInt(), true)
+        else bmp
+        val os = ByteArrayOutputStream()
+        b.compress(Bitmap.CompressFormat.JPEG, 75, os)
+        return Base64.encodeToString(os.toByteArray(), Base64.NO_WRAP)
+    }
+
+    private fun lookAtScreen(id: String, name: String, q: String) {
+        val svc = MyraAccessibilityService.instance
+        if (svc == null) {
+            emit("s", "Accessibility অন করো (Settings → MYRA)")
+            respond(id, name, "Accessibility service is OFF, so the screen cannot be read. Tell the user to enable MYRA in Accessibility settings.")
+            return
+        }
+        emit("s", "📸 Screen দেখছি...")
+        svc.screenshot { bmp ->
+            if (bmp == null) {
+                respond(id, name, "Screenshot failed (needs Android 11+ and accessibility on)")
+                return@screenshot
+            }
+            val b64 = bitmapToB64(bmp)
+            ws?.send("""{"realtimeInput":{"video":{"mimeType":"image/jpeg","data":"$b64"}}}""")
+            respond(id, name, "The screenshot was just sent to you as an image. Look at it now and answer the user's request: $q")
+        }
+    }
+
+    private fun saveToGallery(bmp: Bitmap): Uri? {
+        if (Build.VERSION.SDK_INT < 29) return null
+        val cv = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, "MYRA_${System.currentTimeMillis()}.jpg")
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/MYRA")
+        }
+        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv) ?: return null
+        contentResolver.openOutputStream(uri)?.use { bmp.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+        return uri
+    }
+
+    private fun shareScreenshot(id: String, name: String, app: String) {
+        val svc = MyraAccessibilityService.instance
+        if (svc == null) {
+            emit("s", "Accessibility অন করো (Settings → MYRA)")
+            respond(id, name, "Accessibility service is OFF, cannot take a screenshot. Tell the user to enable MYRA in Accessibility settings.")
+            return
+        }
+        svc.screenshot { bmp ->
+            val uri = if (bmp != null) saveToGallery(bmp) else null
+            if (uri == null) {
+                respond(id, name, "Screenshot failed")
+                return@screenshot
+            }
+            val pkgMap = mapOf(
+                "whatsapp" to "com.whatsapp", "telegram" to "org.telegram.messenger",
+                "gmail" to "com.google.android.gm", "messenger" to "com.facebook.orca"
+            )
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = "image/jpeg"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val pkg = pkgMap[app.lowercase().trim()]
+            if (pkg != null) {
+                send.setPackage(pkg)
+                launch(send)
+            } else launch(Intent.createChooser(send, "Share screenshot"))
+            emit("s", "📸 Screenshot share")
+            respond(id, name, "Screenshot saved to gallery and the share screen is open. The user must pick the contact and tap send.")
+        }
     }
 
     private fun launch(i: Intent) {
@@ -438,7 +680,6 @@ class MyraService : Service() {
     private fun resolveNumber(who: String): String? {
         val digits = who.replace(Regex("[^\\d+]"), "")
         if (digits.length >= 6) return digits
-        // prime contacts: lines like "Name:+8801..."
         prefs.getString("prime", "")?.lines()?.forEach { line ->
             val p = line.split(":", limit = 2)
             if (p.size == 2 && p[0].trim().isNotEmpty() &&
