@@ -25,7 +25,16 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
+import android.app.AlertDialog
+import android.app.Dialog
+import android.content.ContentValues
 import android.graphics.BitmapFactory
+import android.graphics.drawable.ColorDrawable
+import android.provider.MediaStore
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.view.Window
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
@@ -170,6 +179,23 @@ class WaveView(ctx: Context) : View(ctx) {
     }
 }
 
+/** waveform-bars icon used on the round "voice mode" button */
+class BarsIcon(ctx: Context) : View(ctx) {
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
+    override fun onDraw(c: Canvas) {
+        val hs = floatArrayOf(0.28f, 0.5f, 0.72f, 0.5f, 0.28f)
+        val cw = width / 2f
+        val ch = height / 2f
+        val bw = width * 0.06f
+        val gap = width * 0.1f
+        for (i in 0 until 5) {
+            val x = cw + (i - 2) * (bw + gap)
+            val h = height * hs[i] * 0.6f
+            c.drawRoundRect(x - bw / 2, ch - h / 2, x + bw / 2, ch + h / 2, bw / 2, bw / 2, p)
+        }
+    }
+}
+
 class MainActivity : Activity() {
 
     private lateinit var prefs: SharedPreferences
@@ -182,7 +208,25 @@ class MainActivity : Activity() {
     private lateinit var chatBox: LinearLayout
     private lateinit var chatScroll: ScrollView
     private lateinit var mic: TextView
-    private lateinit var action: TextView
+    private lateinit var actionBox: FrameLayout
+    private lateinit var actionText: TextView
+    private lateinit var actionBars: BarsIcon
+    private lateinit var centerBox: LinearLayout
+    private lateinit var barRow: LinearLayout
+    private lateinit var hintTv: TextView
+    private lateinit var modeBtn: TextView
+    private lateinit var dictSp: Spinner
+    private var recognizer: SpeechRecognizer? = null
+    private var dictating = false
+    private var dictBase = ""
+    private var cameraUri: Uri? = null
+    private var layoutKey = ""
+    private val dictCodes = listOf("bn-BD", "hi-IN", "en-US", "en-IN")
+    private val connKeys = listOf("search", "apps", "calls", "sms", "screen")
+    private val connLabels = arrayOf(
+        "Google Search", "Apps & Browser (অ্যাপ/লিংক খোলা)", "Calls & Contacts (কল, কল লিস্ট)",
+        "SMS & WhatsApp", "Screen reading (screenshot)"
+    )
     private lateinit var input: EditText
     private lateinit var batt: TextView
     private lateinit var clock: TextView
@@ -276,33 +320,42 @@ class MainActivity : Activity() {
             text = "⚙"; textSize = 24f; setTextColor(Color.parseColor("#888888")); setPadding(dp(10), 0, 0, 0)
             setOnClickListener { showSettings(true) }
         }
-        right.addView(clock); right.addView(gear)
+        modeBtn = TextView(this).apply {
+            text = "🔴"; textSize = 18f; setPadding(dp(10), 0, 0, 0)
+            setOnClickListener { toggleDisplayMode() }
+        }
+        right.addView(clock); right.addView(modeBtn); right.addView(gear)
         top.addView(batt, LinearLayout.LayoutParams(0, -2, 1f))
-        top.addView(titleBox, LinearLayout.LayoutParams(0, -2, 1.6f))
-        top.addView(right, LinearLayout.LayoutParams(0, -2, 1f))
+        top.addView(titleBox, LinearLayout.LayoutParams(0, -2, 1.3f))
+        top.addView(right, LinearLayout.LayoutParams(0, -2, 1.3f))
         mainView.addView(top)
 
-        // center
-        val center = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER }
+        // chat (sits ABOVE the orb)
+        chatBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        chatScroll = ScrollView(this).apply { addView(chatBox); isVerticalScrollBarEnabled = false }
+        mainView.addView(chatScroll, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        // orb area
+        centerBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER }
         orb = OrbView(this)
+        orb.setOnClickListener {
+            if (MyraService.running) {
+                startService(Intent(this, MyraService::class.java).setAction(MyraService.ACTION_STOP))
+            } else onMicTap()
+        }
         wave = WaveView(this)
         status = TextView(this).apply {
             text = "Tap karke bolo 💬"; setTextColor(Color.parseColor("#777777")); textSize = 13f
             gravity = Gravity.CENTER; setPadding(0, dp(6), 0, 0)
         }
-        center.addView(orb, LinearLayout.LayoutParams(dp(260), dp(260)))
-        center.addView(wave, LinearLayout.LayoutParams(dp(200), dp(40)))
-        center.addView(status)
-        mainView.addView(center, LinearLayout.LayoutParams(-1, 0, 1f))
+        centerBox.addView(orb, LinearLayout.LayoutParams(dp(260), dp(260)))
+        centerBox.addView(wave, LinearLayout.LayoutParams(dp(200), dp(40)))
+        centerBox.addView(status)
+        mainView.addView(centerBox, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        // chat
-        chatBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        chatScroll = ScrollView(this).apply { addView(chatBox) }
-        mainView.addView(chatScroll, LinearLayout.LayoutParams(-1, dp(190)))
-
-        // input bar (Claude-style): + | text | mic | send/stop
+        // input bar (Claude-style): + | text | mic(dictate) | voice/send
         input = EditText(this).apply {
-            hint = "Message MYRA or tap mic"
+            hint = "Message MYRA or tap mic to dictate"
             setHintTextColor(Color.parseColor("#777777")); setTextColor(Color.WHITE)
             textSize = 15f; background = null; maxLines = 4
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
@@ -312,10 +365,19 @@ class MainActivity : Activity() {
                 override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
             })
         }
-        val plus = circleBtn("+", "#232323") { pickImage() }
-        mic = circleBtn("\uD83C\uDFA4", "#232323") { onMicTap() }
-        action = circleBtn("\u25A0", "#FF1744") { onAction() }
-        val bar = LinearLayout(this).apply {
+        val plus = circleBtn("+", "#232323") { showAddSheet() }
+        mic = circleBtn("🎤", "#232323") { onMicBtn() }
+        actionText = TextView(this).apply {
+            text = "➤"; textSize = 20f; gravity = Gravity.CENTER; setTextColor(Color.WHITE)
+        }
+        actionBars = BarsIcon(this)
+        actionBox = FrameLayout(this).apply {
+            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(RED) }
+            addView(actionText, FrameLayout.LayoutParams(-1, -1))
+            addView(actionBars, FrameLayout.LayoutParams(-1, -1))
+            setOnClickListener { onAction() }
+        }
+        barRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(8), dp(8), dp(8), dp(8))
             background = GradientDrawable().apply {
@@ -323,16 +385,18 @@ class MainActivity : Activity() {
                 setStroke(dp(1), Color.parseColor("#2a2a2a"))
             }
         }
-        bar.addView(plus, LinearLayout.LayoutParams(dp(44), dp(44)))
-        bar.addView(input, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(10); rightMargin = dp(6) })
-        bar.addView(mic, LinearLayout.LayoutParams(dp(44), dp(44)))
-        bar.addView(action, LinearLayout.LayoutParams(dp(44), dp(44)).apply { leftMargin = dp(6) })
-        mainView.addView(bar, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
-        mainView.addView(TextView(this).apply {
-            text = "\uD83C\uDFA4 voice / mute  \u2022  \u27A4 send  \u2022  \u25A0 stop  \u2022  + image"
+        barRow.addView(plus, LinearLayout.LayoutParams(dp(44), dp(44)))
+        barRow.addView(input, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(10); rightMargin = dp(6) })
+        barRow.addView(mic, LinearLayout.LayoutParams(dp(44), dp(44)))
+        barRow.addView(actionBox, LinearLayout.LayoutParams(dp(44), dp(44)).apply { leftMargin = dp(6) })
+        mainView.addView(barRow, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        hintTv = TextView(this).apply {
+            text = "🎤 dictate  •  ➤ send  •  bars = live voice  •  + add"
             setTextColor(Color.parseColor("#666666")); textSize = 11f; gravity = Gravity.CENTER
             setPadding(0, dp(6), 0, 0)
-        })
+        }
+        mainView.addView(hintTv)
+        applyLayout()
     }
 
     private fun circleBtn(t: String, fill: String, click: () -> Unit) = TextView(this).apply {
@@ -341,12 +405,54 @@ class MainActivity : Activity() {
         setOnClickListener { click() }
     }
 
-    private fun refreshAction() {
-        val hasText = !input.text.isNullOrBlank()
-        action.text = if (hasText) "\u27A4" else "\u25A0"
-        action.alpha = if (hasText || MyraService.running) 1f else 0.35f
+    // ---- layout: chat above, orb below; or orb-only red screen
+    private fun toggleDisplayMode() {
+        val orbOnly = prefs.getString("display_mode", "chat") == "orb"
+        prefs.edit().putString("display_mode", if (orbOnly) "chat" else "orb").apply()
+        applyLayout()
     }
 
+    private fun applyLayout() {
+        val orbOnly = prefs.getString("display_mode", "chat") == "orb"
+        val hasChat = chatBox.childCount > 0
+        val key = "$orbOnly-$hasChat"
+        if (key == layoutKey) return
+        layoutKey = key
+        val big = orbOnly || !hasChat
+        val o = dp(if (orbOnly) 300 else if (big) 260 else 120)
+        orb.layoutParams = LinearLayout.LayoutParams(o, o)
+        wave.layoutParams = LinearLayout.LayoutParams(dp(if (big) 200 else 140), dp(if (big) 40 else 22))
+        chatScroll.visibility = if (orbOnly || !hasChat) View.GONE else View.VISIBLE
+        centerBox.layoutParams =
+            if (big) LinearLayout.LayoutParams(-1, 0, 1f) else LinearLayout.LayoutParams(-1, -2)
+        barRow.visibility = if (orbOnly) View.GONE else View.VISIBLE
+        hintTv.visibility = if (orbOnly) View.GONE else View.VISIBLE
+        modeBtn.text = if (orbOnly) "💬" else "🔴"
+    }
+
+    private fun refreshAction() {
+        val hasText = !input.text.isNullOrBlank()
+        val running = MyraService.running
+        val showText = hasText || running
+        actionText.visibility = if (showText) View.VISIBLE else View.GONE
+        actionBars.visibility = if (showText) View.GONE else View.VISIBLE
+        actionText.text = if (hasText) "➤" else "■"
+    }
+
+    private fun refreshMic() {
+        val muted = MyraService.running && MyraService.mutedNow
+        mic.text = when {
+            dictating -> "■"
+            muted -> "🔇"
+            else -> "🎤"
+        }
+        mic.alpha = if (muted) 0.5f else 1f
+        (mic.background as? GradientDrawable)?.setColor(Color.parseColor(if (dictating) "#FF1744" else "#232323"))
+    }
+
+    private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_SHORT).show()
+
+    // ---- right button: send text / stop / start live voice
     private fun onAction() {
         val t = input.text.toString().trim()
         if (t.isNotEmpty()) {
@@ -362,29 +468,236 @@ class MainActivity : Activity() {
         }
         if (MyraService.running) {
             startService(Intent(this, MyraService::class.java).setAction(MyraService.ACTION_STOP))
-        }
+        } else onMicTap()
     }
 
-    private fun pickImage() {
-        if (!MyraService.running) {
-            Toast.makeText(this, "আগে 🎤 চেপে MYRA চালু করো", Toast.LENGTH_SHORT).show(); return
+    // ---- mic button: dictate into the text box (or mute when live voice is on)
+    private fun onMicBtn() {
+        if (MyraService.running) {
+            startService(Intent(this, MyraService::class.java).setAction(MyraService.ACTION_MUTE))
+        } else toggleDictation()
+    }
+
+    private fun toggleDictation() {
+        if (dictating) { recognizer?.stopListening(); return }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 2); return
         }
-        startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).setType("image/*"), 7)
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            toast("Speech recognition নেই (Google অ্যাপ লাগবে)"); return
+        }
+        val r = SpeechRecognizer.createSpeechRecognizer(this)
+        recognizer = r
+        val cur = input.text.toString()
+        dictBase = if (cur.isBlank()) "" else cur.trimEnd() + " "
+        r.setRecognitionListener(object : RecognitionListener {
+            override fun onReadyForSpeech(p: Bundle?) { dictating = true; refreshMic(); status.text = "Bolo... বলো 🎤" }
+            override fun onBeginningOfSpeech() {}
+            override fun onRmsChanged(v: Float) {}
+            override fun onBufferReceived(b: ByteArray?) {}
+            override fun onEndOfSpeech() {}
+            override fun onError(e: Int) {
+                endDictation()
+                if (e != SpeechRecognizer.ERROR_NO_MATCH && e != SpeechRecognizer.ERROR_SPEECH_TIMEOUT) toast("Mic error $e")
+            }
+            override fun onResults(b: Bundle?) { putDictation(b); endDictation() }
+            override fun onPartialResults(b: Bundle?) { putDictation(b) }
+            override fun onEvent(t: Int, p: Bundle?) {}
+        })
+        val lang = prefs.getString("dict_lang", "bn-BD")
+        r.startListening(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+        })
+    }
+
+    private fun putDictation(b: Bundle?) {
+        val t = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull() ?: return
+        input.setText(dictBase + t)
+        input.setSelection(input.text.length)
+    }
+
+    private fun endDictation() {
+        dictating = false
+        refreshMic()
+        if (!MyraService.running) status.text = "Tap karke bolo 💬"
+        try { recognizer?.destroy() } catch (_: Exception) {}
+        recognizer = null
+    }
+
+    override fun onDestroy() {
+        try { recognizer?.destroy() } catch (_: Exception) {}
+        super.onDestroy()
+    }
+
+    // ---- "+" sheet: Camera / Photos / Files / Project / Permission / Connectors / Skills
+    private fun needRunning(): Boolean {
+        if (MyraService.running) return true
+        toast("আগে MYRA চালু করো (লাল বাটন চাপো)")
+        return false
+    }
+
+    private fun showAddSheet() {
+        val d = Dialog(this)
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val rad = dp(24).toFloat()
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(dp(16), dp(14), dp(16), dp(22))
+        col.background = GradientDrawable().apply {
+            setColor(Color.parseColor("#1a1a1a")); cornerRadii = floatArrayOf(rad, rad, rad, rad, 0f, 0f, 0f, 0f)
+        }
+        col.addView(TextView(this).apply {
+            text = "Add to session"; setTextColor(Color.WHITE); textSize = 17f
+            typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER; setPadding(0, 0, 0, dp(14))
+        })
+        val tiles = LinearLayout(this)
+        tiles.orientation = LinearLayout.HORIZONTAL
+        fun tile(icon: String, label: String, click: () -> Unit) {
+            val t = LinearLayout(this)
+            t.orientation = LinearLayout.VERTICAL; t.gravity = Gravity.CENTER
+            t.background = GradientDrawable().apply { cornerRadius = dp(16).toFloat(); setColor(Color.parseColor("#262626")) }
+            t.addView(TextView(this).apply { text = icon; textSize = 26f; gravity = Gravity.CENTER })
+            t.addView(TextView(this).apply {
+                text = label; setTextColor(Color.WHITE); textSize = 13f; gravity = Gravity.CENTER; setPadding(0, dp(4), 0, 0)
+            })
+            t.setOnClickListener { d.dismiss(); click() }
+            tiles.addView(t, LinearLayout.LayoutParams(0, dp(90), 1f).apply { setMargins(dp(4), 0, dp(4), 0) })
+        }
+        fun row(icon: String, title: String, sub: String, click: () -> Unit) {
+            val r2 = LinearLayout(this)
+            r2.orientation = LinearLayout.HORIZONTAL; r2.gravity = Gravity.CENTER_VERTICAL
+            r2.setPadding(dp(14), dp(12), dp(14), dp(12))
+            r2.background = GradientDrawable().apply { cornerRadius = dp(16).toFloat(); setColor(Color.parseColor("#262626")) }
+            r2.addView(TextView(this).apply { text = icon; textSize = 22f; setPadding(0, 0, dp(14), 0) })
+            val tb = LinearLayout(this)
+            tb.orientation = LinearLayout.VERTICAL
+            tb.addView(TextView(this).apply { text = title; setTextColor(Color.WHITE); textSize = 16f })
+            tb.addView(TextView(this).apply { text = sub; setTextColor(Color.parseColor("#999999")); textSize = 13f })
+            r2.addView(tb, LinearLayout.LayoutParams(0, -2, 1f))
+            r2.addView(TextView(this).apply { text = "›"; setTextColor(Color.GRAY); textSize = 22f })
+            r2.setOnClickListener { d.dismiss(); click() }
+            col.addView(r2, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        }
+        tile("📷", "Camera") { if (needRunning()) takePhoto() }
+        tile("🖼", "Photos") { if (needRunning()) pickFile("image/*", 7) }
+        tile("📄", "Files") { if (needRunning()) pickFile("*/*", 9) }
+        col.addView(tiles)
+
+        val projSub = if (prefs.getString("project", "").isNullOrBlank()) "None" else "Added"
+        val perm = if (prefs.getString("perm_mode", "manual") == "manual") "Manual" else "Auto"
+        val connOn = connKeys.count { prefs.getBoolean("conn_$it", true) }
+        val skillN = (prefs.getString("skills", "") ?: "").lines().count { it.isNotBlank() }
+        row("📁", "Add to project", projSub) {
+            editDialog("Project (MYRA-কে এই context মনে রাখতে বলো)", "যেমন: আমি একজন ছাত্র, HSC পরীক্ষার প্রস্তুতি নিচ্ছি…", "project")
+        }
+        row("✋", "Permission", perm) { permDialog() }
+        row("🧩", "Connectors", "$connOn of ${connKeys.size} on") { connDialog() }
+        row("📚", "Skills", if (skillN == 0) "None" else "$skillN added") {
+            editDialog("Skills (প্রতি লাইনে একটা)", "English tutor: আমার ভুল ঠিক করে দেবে\nCook: রেসিপি বলবে", "skills")
+        }
+        d.setContentView(col)
+        d.window?.setLayout(-1, -2)
+        d.window?.setGravity(Gravity.BOTTOM)
+        d.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        d.show()
+    }
+
+    private fun editDialog(title: String, hint: String, key: String) {
+        val et = EditText(this)
+        et.setText(prefs.getString(key, ""))
+        et.hint = hint
+        et.minLines = 4
+        et.gravity = Gravity.TOP or Gravity.START
+        et.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        et.setPadding(dp(16), dp(12), dp(16), dp(12))
+        AlertDialog.Builder(this).setTitle(title).setView(et)
+            .setPositiveButton("Save") { _, _ ->
+                prefs.edit().putString(key, et.text.toString().trim()).apply()
+                toast("Saved ✓ (MYRA Stop → Start করলে কাজ করবে)")
+            }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    private fun permDialog() {
+        val items = arrayOf("Manual — কল/SMS/মেসেজের আগে MYRA জিজ্ঞেস করবে", "Auto — সরাসরি করে ফেলবে")
+        val cur = if (prefs.getString("perm_mode", "manual") == "manual") 0 else 1
+        AlertDialog.Builder(this).setTitle("Permission")
+            .setSingleChoiceItems(items, cur) { dlg, which ->
+                prefs.edit().putString("perm_mode", if (which == 0) "manual" else "auto").apply()
+                dlg.dismiss(); toast("Saved ✓ (MYRA Stop → Start করলে কাজ করবে)")
+            }.show()
+    }
+
+    private fun connDialog() {
+        val checked = BooleanArray(connKeys.size) { prefs.getBoolean("conn_${connKeys[it]}", true) }
+        AlertDialog.Builder(this).setTitle("Connectors")
+            .setMultiChoiceItems(connLabels, checked) { _, i, on -> checked[i] = on }
+            .setPositiveButton("Save") { _, _ ->
+                val e = prefs.edit()
+                connKeys.forEachIndexed { i, k -> e.putBoolean("conn_$k", checked[i]) }
+                e.apply(); toast("Saved ✓ (MYRA Stop → Start করলে কাজ করবে)")
+            }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    private fun pickFile(mime: String, code: Int) {
+        startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).setType(mime), code)
+    }
+
+    private fun takePhoto() {
+        if (Build.VERSION.SDK_INT < 29) { toast("Camera Android 10+ লাগে"); return }
+        val cv = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, "MYRA_cam_${System.currentTimeMillis()}.jpg")
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/MYRA")
+        }
+        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv) ?: return
+        cameraUri = uri
+        try {
+            startActivityForResult(Intent(MediaStore.ACTION_IMAGE_CAPTURE).putExtra(MediaStore.EXTRA_OUTPUT, uri), 8)
+        } catch (e: Exception) { toast("Camera খোলা যায়নি: ${e.message}") }
     }
 
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(req: Int, res: Int, data: Intent?) {
         super.onActivityResult(req, res, data)
-        if (req != 7 || res != RESULT_OK) return
-        val uri = data?.data ?: return
+        if (res != RESULT_OK) return
+        when (req) {
+            7 -> data?.data?.let { sendImageUri(it) }
+            8 -> cameraUri?.let { sendImageUri(it) }
+            9 -> data?.data?.let { handleFile(it) }
+        }
+    }
+
+    private fun sendImageUri(uri: Uri) {
         try {
             val opts = BitmapFactory.Options().apply { inSampleSize = 2 }
             contentResolver.openInputStream(uri)?.use {
                 MyraService.pendingImage = BitmapFactory.decodeStream(it, null, opts)
             }
             startService(Intent(this, MyraService::class.java).setAction(MyraService.ACTION_IMAGE))
-        } catch (e: Exception) {
-            Toast.makeText(this, "Image পড়া যায়নি: ${e.message}", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) { toast("Image পড়া যায়নি: ${e.message}") }
+    }
+
+    private fun handleFile(uri: Uri) {
+        val mime = contentResolver.getType(uri) ?: ""
+        val nm = uri.lastPathSegment ?: "file"
+        val isText = mime.startsWith("text/") || nm.endsWith(".txt") || nm.endsWith(".md") ||
+            nm.endsWith(".csv") || nm.endsWith(".json")
+        when {
+            mime.startsWith("image/") -> sendImageUri(uri)
+            isText -> {
+                val txt = try {
+                    contentResolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }?.take(15000) ?: ""
+                } catch (e: Exception) { "" }
+                if (txt.isBlank()) toast("ফাইল পড়া যায়নি") else
+                    startService(Intent(this, MyraService::class.java).setAction(MyraService.ACTION_TEXT)
+                        .putExtra("text", "I'm sharing a file named $nm. Its content:\n$txt\n\nRead it and help me with it."))
+            }
+            else -> toast("এই ফাইল টাইপ এখনো সাপোর্ট করে না (শুধু ছবি ও টেক্সট ফাইল)")
         }
     }
 
@@ -404,6 +717,7 @@ class MainActivity : Activity() {
         cc = edit("Country code, যেমন 880 (WhatsApp-এ 01.. নম্বরের জন্য)").apply {
             inputType = InputType.TYPE_CLASS_NUMBER
         }
+        dictSp = spinner(listOf("বাংলা (bn-BD)", "हिन्दी (hi-IN)", "English (en-US)", "English (en-IN)"))
         modelSp = spinner(listOf("Native Audio (Human Voice)", "Flash Live (Fast)", "Pro Audio Dialog"))
         voiceSp = spinner(voices)
         persSp = spinner(persLabels)
@@ -415,6 +729,7 @@ class MainActivity : Activity() {
         modelSp.setSelection(models.indexOf(prefs.getString("model", models[0])).coerceAtLeast(0))
         voiceSp.setSelection(voices.indexOf(prefs.getString("voice", "Aoede")).coerceAtLeast(0))
         persSp.setSelection(pers.indexOf(prefs.getString("personality", "gf")).coerceAtLeast(0))
+        dictSp.setSelection(dictCodes.indexOf(prefs.getString("dict_lang", "bn-BD")).coerceAtLeast(0))
 
         col.addView(label("API KEY")); col.addView(key)
         col.addView(label("YOUR NAME")); col.addView(name)
@@ -423,6 +738,7 @@ class MainActivity : Activity() {
         col.addView(label("PERSONALITY")); col.addView(persSp)
         col.addView(label("PRIME CONTACTS")); col.addView(prime)
         col.addView(label("COUNTRY CODE")); col.addView(cc)
+        col.addView(label("DICTATION LANGUAGE (🎤 দিয়ে লেখার ভাষা)")); col.addView(dictSp)
         col.addView(button("SAVE", RED) { save(); showSettings(false) },
             LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
         col.addView(label("PERMISSIONS (ব্যাকগ্রাউন্ডে ভালো চলার জন্য)"))
@@ -469,10 +785,10 @@ class MainActivity : Activity() {
                 else -> "listening"
             }
             wave.active = running
-            val red = if (running) 0.08f else 0f
+            val orbOnly = prefs.getString("display_mode", "chat") == "orb"
+            val red = if (orbOnly) (if (running) 0.6f else 0.25f) else if (running) 0.08f else 0f
             if (red != lastRed) { lastRed = red; redFx.animate().alpha(red).setDuration(400).start() }
-            mic.text = if (running && MyraService.mutedNow) "🔇" else "🎤"
-            mic.alpha = if (running && MyraService.mutedNow) 0.5f else 1f
+            refreshMic()
             refreshAction()
             if (!running && (st.startsWith("Listening") || st.startsWith("Connecting"))) status.text = "Tap karke bolo 💬"
             if (tick % 300 == 0) updateInfo()
@@ -491,8 +807,9 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        chatBox.removeAllViews(); lastBubble = ""
+        chatBox.removeAllViews(); lastBubble = ""; layoutKey = ""
         MyraService.log.forEach { onEvent(it.first, it.second) }
+        applyLayout()
         MyraService.listener = { k, t -> runOnUiThread { onEvent(k, t) } }
         updateInfo()
         handler.removeCallbacks(ticker); handler.post(ticker)
@@ -519,6 +836,7 @@ class MainActivity : Activity() {
             typeface = Typeface.MONOSPACE; setPadding(dp(4), dp(3), dp(4), dp(3))
         }
         chatBox.addView(tv)
+        applyLayout()
         chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
     }
 
@@ -540,6 +858,7 @@ class MainActivity : Activity() {
             topMargin = dp(5); gravity = if (user) Gravity.END else Gravity.START
         }
         chatBox.addView(tv, lp)
+        applyLayout()
         chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
     }
 
@@ -550,6 +869,7 @@ class MainActivity : Activity() {
             .putString("name", name.text.toString().trim().ifEmpty { "Friend" })
             .putString("prime", prime.text.toString().trim())
             .putString("cc", cc.text.toString().trim())
+            .putString("dict_lang", dictCodes[dictSp.selectedItemPosition])
             .putString("model", models[modelSp.selectedItemPosition])
             .putString("voice", voices[voiceSp.selectedItemPosition])
             .putString("personality", pers[persSp.selectedItemPosition])
@@ -580,6 +900,10 @@ class MainActivity : Activity() {
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, res: IntArray) {
         super.onRequestPermissionsResult(code, perms, res)
+        if (code == 2) {
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) toggleDictation()
+            return
+        }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             startMyra()
         } else Toast.makeText(this, "Mic permission ছাড়া চলবে না", Toast.LENGTH_LONG).show()
