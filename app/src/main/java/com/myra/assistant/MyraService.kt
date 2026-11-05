@@ -52,6 +52,10 @@ class MyraService : Service() {
         const val ACTION_START = "com.myra.START"
         const val ACTION_STOP = "com.myra.STOP"
         const val ACTION_MUTE = "com.myra.MUTE"
+        const val ACTION_TEXT = "com.myra.TEXT"
+        const val ACTION_IMAGE = "com.myra.IMAGE"
+        @Volatile var pendingText: String? = null
+        @Volatile var pendingImage: Bitmap? = null
         private const val CHANNEL_ID = "myra_voice"
         private const val NOTIF_ID = 1
         private const val WS_URL =
@@ -108,6 +112,8 @@ class MyraService : Service() {
                 emit("s", if (muted) "Mic muted 🔇" else "Listening... 🎤")
                 updateNotification()
             }
+            ACTION_TEXT -> intent?.getStringExtra("text")?.let { sendUserText(it) }
+            ACTION_IMAGE -> pendingImage?.let { sendImage(it); pendingImage = null }
             else -> startAll()
         }
         return START_STICKY
@@ -326,6 +332,7 @@ class MyraService : Service() {
         val decls = JSONArray()
             .put(fn("open_app", "Open an installed app on the phone by its name, e.g. youtube, whatsapp, camera", "name"))
             .put(fn("call_contact", "Make a phone call to a contact name or a phone number", "name_or_number"))
+            .put(fn("find_contact", "Search the phone contacts by (part of) a name and return matching names with numbers", "name"))
             .put(fn("get_recent_calls", "Get the user's recent call log (last 10 calls with names, numbers, type and time)"))
             .put(fn("send_sms", "Send an SMS text message to a contact name or number", "to", "message"))
             .put(fn("send_whatsapp", "Send a WhatsApp message to a contact name or number", "to", "message"))
@@ -379,7 +386,8 @@ class MyraService : Service() {
             "see their call history, look at/read/solve what is on their screen, share a screenshot or open a web page, " +
             "CALL the matching function instead of only talking, then confirm briefly after it returns. " +
             "For questions needing current information, use Google Search. If the user wants a link/page, use open_url. " +
-            "For send_sms and send_whatsapp, if the message text is missing, ask the user what to write first."
+            "For send_sms and send_whatsapp, if the message text is missing, ask the user what to write first. " +
+            "If call_contact or a message function says no number was found, call find_contact with the name, then retry with the number."
     }
 
     private fun greeting(): String {
@@ -410,7 +418,12 @@ class MyraService : Service() {
             emit("s", "Listening... 🎤")
             handler.removeCallbacks(renew)
             handler.postDelayed(renew, RENEW_MS)
-            if (!greeted) { greeted = true; handler.postDelayed({ sendText(greeting()) }, 400) }
+            val pt = pendingText
+            pendingText = null
+            if (pt != null) {
+                greeted = true
+                handler.postDelayed({ sendUserText(pt) }, 400)
+            } else if (!greeted) { greeted = true; handler.postDelayed({ sendText(greeting()) }, 400) }
             return
         }
         m.optJSONObject("toolCall")?.let { handleToolCall(it); return }
@@ -469,7 +482,26 @@ class MyraService : Service() {
         }
     }
 
+    private fun sendUserText(t: String) {
+        if (!ready) { pendingText = t; emit("s", "Connecting... একটু অপেক্ষা করো"); return }
+        emit("u", t)
+        ws?.send(JSONObject().put("realtimeInput", JSONObject().put("text", t)).toString())
+    }
+
+    private fun sendImage(bmp: Bitmap) {
+        if (!ready) { emit("s", "Connecting... একটু পরে আবার দাও"); return }
+        emit("u", "📎 Image")
+        ws?.send("""{"realtimeInput":{"video":{"mimeType":"image/jpeg","data":"${bitmapToB64(bmp)}"}}}""")
+        ws?.send(
+            JSONObject().put(
+                "realtimeInput",
+                JSONObject().put("text", "I just sent you an image. Look at it, tell me what you see and help me with it.")
+            ).toString()
+        )
+    }
+
     private fun respond(id: String, name: String, result: String) {
+        emit("t", "⚙ $name → ${result.replace("\n", " ").take(110)}")
         val r = JSONObject().put(
             "toolResponse", JSONObject().put(
                 "functionResponses", JSONArray().put(
@@ -486,6 +518,7 @@ class MyraService : Service() {
             "open_app" -> respond(id, name, openApp(a.optString("name").lowercase().trim()))
             "call_contact" -> respond(id, name, callContact(a.optString("name_or_number").lowercase().trim()))
             "get_recent_calls" -> respond(id, name, recentCalls())
+            "find_contact" -> respond(id, name, findContact(a.optString("name").trim()))
             "send_sms" -> respond(id, name, sendSms(a.optString("to").lowercase().trim(), a.optString("message")))
             "send_whatsapp" -> respond(id, name, sendWhatsapp(a.optString("to").lowercase().trim(), a.optString("message")))
             "open_url" -> respond(id, name, openUrl(a.optString("url").trim()))
@@ -519,12 +552,36 @@ class MyraService : Service() {
     }
 
     private fun callContact(who: String): String {
-        val number = resolveNumber(who) ?: return "No phone number found for '$who'"
-        if (checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED)
-            return "CALL_PHONE permission not granted"
+        val number = resolveNumber(who)
+            ?: return "No phone number found for '$who'. Call find_contact to search by name, or ask the user for the exact saved name or number."
+        if (checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+            launch(Intent(Intent.ACTION_DIAL, Uri.parse("tel:$number")))
+            return "CALL_PHONE permission is not granted, so the dialer was opened with $who ($number). The user must press the call button."
+        }
         launch(Intent(Intent.ACTION_CALL, Uri.parse("tel:$number")))
         emit("s", "📞 Calling $who")
         return "Calling $who ($number)"
+    }
+
+    private fun findContact(q: String): String {
+        if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED)
+            return "READ_CONTACTS permission not granted"
+        val sb = StringBuilder()
+        try {
+            contentResolver.query(
+                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                arrayOf(
+                    ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                    ContactsContract.CommonDataKinds.Phone.NUMBER
+                ),
+                "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?",
+                arrayOf("%$q%"), null
+            )?.use { c ->
+                var n = 0
+                while (c.moveToNext() && n < 6) { sb.append("${c.getString(0)}: ${c.getString(1)}\n"); n++ }
+            }
+        } catch (e: Exception) { return "Contact search failed: ${e.message}" }
+        return if (sb.isEmpty()) "No contact matches '$q'" else sb.toString()
     }
 
     private fun recentCalls(): String {
@@ -561,15 +618,24 @@ class MyraService : Service() {
 
     private fun sendSms(to: String, msg: String): String {
         if (msg.isBlank()) return "Message text is empty"
-        if (checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED)
-            return "SEND_SMS permission not granted"
-        val num = resolveNumber(to) ?: return "No phone number found for '$to'"
+        val num = resolveNumber(to)
+            ?: return "No phone number found for '$to'. Call find_contact to search by name, or ask the user for the number."
+        val fallback = {
+            launch(Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:$num")).putExtra("sms_body", msg))
+        }
+        if (checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) {
+            fallback()
+            return "SEND_SMS permission is not granted, so the Messages app was opened with the text for $to ($num). The user must tap send."
+        }
         return try {
             val sm = smsManager()
             sm.sendMultipartTextMessage(num, null, sm.divideMessage(msg), null, null)
             emit("s", "✉ SMS sent to $to")
             "SMS sent to $to ($num)"
-        } catch (e: Exception) { "SMS failed: ${e.message}" }
+        } catch (e: Exception) {
+            fallback()
+            "SMS sending failed (${e.message}); the Messages app was opened with the text, the user must tap send."
+        }
     }
 
     private fun sendWhatsapp(to: String, msg: String): String {
@@ -691,14 +757,17 @@ class MyraService : Service() {
                 ?.split(":", limit = 2)?.get(1)?.trim()?.let { return it }
         }
         if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) return null
-        try {
-            contentResolver.query(
-                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-                arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER),
-                "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?",
-                arrayOf("%$who%"), null
-            )?.use { if (it.moveToFirst()) return it.getString(0) }
-        } catch (_: Exception) {}
+        val tries = listOf(who) + who.split(" ").filter { it.length >= 3 && it != who }
+        for (q in tries) {
+            try {
+                contentResolver.query(
+                    ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                    arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER),
+                    "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?",
+                    arrayOf("%$q%"), null
+                )?.use { if (it.moveToFirst()) return it.getString(0) }
+            } catch (_: Exception) {}
+        }
         return null
     }
 
