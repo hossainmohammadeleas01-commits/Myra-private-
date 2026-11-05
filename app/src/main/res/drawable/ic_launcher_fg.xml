@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- long hair (back) -->
+    <path
+        android:fillColor="#3B0F4F"
+        android:pathData="M54,24 C36,24 30,40 31,58 C32,72 36,80 40,86 L68,86 C72,80 76,72 77,58 C78,40 72,24 54,24 Z" />
+    <!-- shoulders / top -->
+    <path
+        android:fillColor="#FF1744"
+        android:pathData="M32,92 C34,78 45,73 54,73 C63,73 74,78 76,92 Z" />
+    <!-- neck -->
+    <path
+        android:fillColor="#E9B592"
+        android:pathData="M48,62 L60,62 L60,74 C57,77 51,77 48,74 Z" />
+    <!-- face -->
+    <path
+        android:fillColor="#F6CBB0"
+        android:pathData="M54,31 C44,31 40,42 41,52 C42,62 48,68 54,68 C60,68 66,62 67,52 C68,42 64,31 54,31 Z" />
+    <!-- fringe -->
+    <path
+        android:fillColor="#4A1560"
+        android:pathData="M40,52 C38,34 46,26 54,26 C62,26 70,34 68,52 C66,42 61,38 55,37 C49,38 43,43 40,52 Z" />
+    <!-- eyes -->
+    <path
+        android:fillColor="#2B1020"
+        android:pathData="M48,53m-1.7,0a1.7,2 0,1 1,3.4 0a1.7,2 0,1 1,-3.4 0" />
+    <path
+        android:fillColor="#2B1020"
+        android:pathData="M60,53m-1.7,0a1.7,2 0,1 1,3.4 0a1.7,2 0,1 1,-3.4 0" />
+    <!-- blush -->
+    <path
+        android:fillColor="#55FF6B8A"
+        android:pathData="M45,59m-3,0a3,2 0,1 1,6 0a3,2 0,1 1,-6 0" />
+    <path
+        android:fillColor="#55FF6B8A"
+        android:pathData="M63,59m-3,0a3,2 0,1 1,6 0a3,2 0,1 1,-6 0" />
+    <!-- lips -->
+    <path
+        android:fillColor="#E0245E"
+        android:pathData="M50.5,61 Q54,65 57.5,61 Q54,62.6 50.5,61 Z" />
+    <!-- hair bow -->
+    <path
+        android:fillColor="#FF1744"
+        android:pathData="M63,30 L70,26 L70,34 Z M63,30 L56,26 L56,34 Z" />
+    <path
+        android:fillColor="#FF8A9B"
+        android:pathData="M63,30m-1.8,0a1.8,1.8 0,1 1,3.6 0a1.8,1.8 0,1 1,-3.6 0" />
+</vector>
