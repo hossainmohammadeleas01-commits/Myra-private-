@@ -328,22 +328,48 @@ class MyraService : Service() {
         return o
     }
 
+    private fun conn(k: String) = prefs.getBoolean("conn_$k", true)
+
     private fun toolsJson(): JSONArray {
         val decls = JSONArray()
-            .put(fn("open_app", "Open an installed app on the phone by its name, e.g. youtube, whatsapp, camera", "name"))
-            .put(fn("call_contact", "Make a phone call to a contact name or a phone number", "name_or_number"))
-            .put(fn("find_contact", "Search the phone contacts by (part of) a name and return matching names with numbers", "name"))
-            .put(fn("get_recent_calls", "Get the user's recent call log (last 10 calls with names, numbers, type and time)"))
-            .put(fn("send_sms", "Send an SMS text message to a contact name or number", "to", "message"))
-            .put(fn("send_whatsapp", "Send a WhatsApp message to a contact name or number", "to", "message"))
-            .put(fn("open_url", "Open a web page in the browser. Pass a full URL, or a search phrase to open a Google search", "url"))
-            .put(fn("look_at_screen", "Take a screenshot of what is currently on the phone screen and look at it, to read it, explain it or solve a problem shown on it", "question"))
-            .put(fn("share_screenshot", "Take a screenshot and open the share sheet. app can be whatsapp, telegram, gmail or empty", "app"))
-            .put(fn("go_home", "Go to the phone home screen"))
-            .put(fn("stop_assistant", "Shut down the MYRA assistant when the user says stop, goodbye or band karo"))
-        return JSONArray()
-            .put(JSONObject().put("googleSearch", JSONObject()))
-            .put(JSONObject().put("functionDeclarations", decls))
+        if (conn("apps")) {
+            decls.put(fn("open_app", "Open an installed app on the phone by its name, e.g. youtube, whatsapp, camera", "name"))
+            decls.put(fn("open_url", "Open a web page in the browser. Pass a full URL, or a search phrase to open a Google search", "url"))
+            decls.put(fn("go_home", "Go to the phone home screen"))
+        }
+        if (conn("calls")) {
+            decls.put(fn("find_contact", "Search the phone contacts by (part of) a name and return matching names with numbers", "name"))
+            decls.put(fn("call_contact", "Make a phone call to a contact name or a phone number", "name_or_number"))
+            decls.put(fn("get_recent_calls", "Get the user's recent call log (last 10 calls with names, numbers, type and time)"))
+        }
+        if (conn("sms")) {
+            decls.put(fn("send_sms", "Send an SMS text message to a contact name or number", "to", "message"))
+            decls.put(fn("send_whatsapp", "Send a WhatsApp message to a contact name or number", "to", "message"))
+        }
+        if (conn("screen")) {
+            decls.put(fn("look_at_screen", "Take a screenshot of what is currently on the phone screen and look at it, to read it, explain it or solve a problem shown on it", "question"))
+            decls.put(fn("share_screenshot", "Take a screenshot and open the share sheet. app can be whatsapp, telegram, gmail or empty", "app"))
+        }
+        decls.put(fn("stop_assistant", "Shut down the MYRA assistant when the user says stop, goodbye or band karo"))
+        val tools = JSONArray()
+        if (conn("search")) tools.put(JSONObject().put("googleSearch", JSONObject()))
+        tools.put(JSONObject().put("functionDeclarations", decls))
+        return tools
+    }
+
+    private fun extraPrompt(): String {
+        val sb = StringBuilder()
+        if (prefs.getString("perm_mode", "manual") == "manual") {
+            sb.append("\nPERMISSION MODE: MANUAL. Before you call call_contact, send_sms, send_whatsapp or share_screenshot, ")
+            sb.append("say out loud exactly what you are about to do (who and what) and wait for the user to say yes (haan / yes / ok). Only then call the function.")
+        } else {
+            sb.append("\nPERMISSION MODE: AUTO. Perform actions directly without asking for confirmation, unless details are missing.")
+        }
+        val project = prefs.getString("project", "")?.trim().orEmpty()
+        if (project.isNotEmpty()) sb.append("\nProject context given by the user (remember and use it):\n").append(project)
+        val skills = prefs.getString("skills", "")?.trim().orEmpty()
+        if (skills.isNotEmpty()) sb.append("\nSkills the user taught you (follow them when relevant):\n").append(skills)
+        return sb.toString()
     }
 
     private fun buildSetup(): String {
@@ -387,7 +413,7 @@ class MyraService : Service() {
             "CALL the matching function instead of only talking, then confirm briefly after it returns. " +
             "For questions needing current information, use Google Search. If the user wants a link/page, use open_url. " +
             "For send_sms and send_whatsapp, if the message text is missing, ask the user what to write first. " +
-            "If call_contact or a message function says no number was found, call find_contact with the name, then retry with the number."
+            "If call_contact or a message function says no number was found, call find_contact with the name, then retry with the number." + extraPrompt()
     }
 
     private fun greeting(): String {
@@ -484,7 +510,7 @@ class MyraService : Service() {
 
     private fun sendUserText(t: String) {
         if (!ready) { pendingText = t; emit("s", "Connecting... একটু অপেক্ষা করো"); return }
-        emit("u", t)
+        emit("u", if (t.length > 200) t.take(200) + "…" else t)
         ws?.send(JSONObject().put("realtimeInput", JSONObject().put("text", t)).toString())
     }
 
