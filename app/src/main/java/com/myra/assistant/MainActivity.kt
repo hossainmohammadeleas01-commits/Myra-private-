@@ -25,7 +25,10 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
+import android.graphics.BitmapFactory
+import android.text.Editable
 import android.text.InputType
+import android.text.TextWatcher
 import android.text.util.Linkify
 import android.view.Gravity
 import android.view.View
@@ -179,6 +182,8 @@ class MainActivity : Activity() {
     private lateinit var chatBox: LinearLayout
     private lateinit var chatScroll: ScrollView
     private lateinit var mic: TextView
+    private lateinit var action: TextView
+    private lateinit var input: EditText
     private lateinit var batt: TextView
     private lateinit var clock: TextView
     private lateinit var key: EditText
@@ -295,41 +300,92 @@ class MainActivity : Activity() {
         chatScroll = ScrollView(this).apply { addView(chatBox) }
         mainView.addView(chatScroll, LinearLayout.LayoutParams(-1, dp(190)))
 
-        // mic button
-        mic = TextView(this).apply {
-            text = "🎤"; textSize = 30f; gravity = Gravity.CENTER
+        // input bar (Claude-style): + | text | mic | send/stop
+        input = EditText(this).apply {
+            hint = "Message MYRA or tap mic"
+            setHintTextColor(Color.parseColor("#777777")); setTextColor(Color.WHITE)
+            textSize = 15f; background = null; maxLines = 4
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            addTextChangedListener(object : TextWatcher {
+                override fun afterTextChanged(s: Editable?) { refreshAction() }
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            })
+        }
+        val plus = circleBtn("+", "#232323") { pickImage() }
+        mic = circleBtn("\uD83C\uDFA4", "#232323") { onMicTap() }
+        action = circleBtn("\u25A0", "#FF1744") { onAction() }
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(8), dp(8), dp(8), dp(8))
             background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL; setColor(Color.parseColor("#0b0b0b")); setStroke(dp(2), RED)
-            }
-            setOnClickListener { onMicTap() }
-            setOnLongClickListener {
-                if (MyraService.running) {
-                    startService(Intent(this@MainActivity, MyraService::class.java).setAction(MyraService.ACTION_STOP))
-                }
-                true
+                cornerRadius = dp(32).toFloat(); setColor(Color.parseColor("#141414"))
+                setStroke(dp(1), Color.parseColor("#2a2a2a"))
             }
         }
-        val stopBtn = TextView(this).apply {
-            text = "⏻"; textSize = 22f; gravity = Gravity.CENTER; setTextColor(RED)
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL; setColor(Color.parseColor("#1a0000")); setStroke(dp(1), RED)
-            }
-            setOnClickListener {
-                if (MyraService.running) {
-                    startService(Intent(this@MainActivity, MyraService::class.java).setAction(MyraService.ACTION_STOP))
-                }
-            }
-        }
-        val micRow = LinearLayout(this).apply { gravity = Gravity.CENTER; setPadding(0, dp(8), 0, 0) }
-        micRow.addView(stopBtn, LinearLayout.LayoutParams(dp(52), dp(52)).apply { rightMargin = dp(20) })
-        micRow.addView(mic, LinearLayout.LayoutParams(dp(72), dp(72)))
-        micRow.addView(View(this), LinearLayout.LayoutParams(dp(52), dp(52)).apply { leftMargin = dp(20) })
-        mainView.addView(micRow)
+        bar.addView(plus, LinearLayout.LayoutParams(dp(44), dp(44)))
+        bar.addView(input, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(10); rightMargin = dp(6) })
+        bar.addView(mic, LinearLayout.LayoutParams(dp(44), dp(44)))
+        bar.addView(action, LinearLayout.LayoutParams(dp(44), dp(44)).apply { leftMargin = dp(6) })
+        mainView.addView(bar, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
         mainView.addView(TextView(this).apply {
-            text = "🎤 start / mute  •  ⏻ stop"
+            text = "\uD83C\uDFA4 voice / mute  \u2022  \u27A4 send  \u2022  \u25A0 stop  \u2022  + image"
             setTextColor(Color.parseColor("#666666")); textSize = 11f; gravity = Gravity.CENTER
             setPadding(0, dp(6), 0, 0)
         })
+    }
+
+    private fun circleBtn(t: String, fill: String, click: () -> Unit) = TextView(this).apply {
+        text = t; textSize = 20f; gravity = Gravity.CENTER; setTextColor(Color.WHITE)
+        background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.parseColor(fill)) }
+        setOnClickListener { click() }
+    }
+
+    private fun refreshAction() {
+        val hasText = !input.text.isNullOrBlank()
+        action.text = if (hasText) "\u27A4" else "\u25A0"
+        action.alpha = if (hasText || MyraService.running) 1f else 0.35f
+    }
+
+    private fun onAction() {
+        val t = input.text.toString().trim()
+        if (t.isNotEmpty()) {
+            input.setText("")
+            if (MyraService.running) {
+                startService(Intent(this, MyraService::class.java)
+                    .setAction(MyraService.ACTION_TEXT).putExtra("text", t))
+            } else {
+                MyraService.pendingText = t
+                onMicTap()
+            }
+            return
+        }
+        if (MyraService.running) {
+            startService(Intent(this, MyraService::class.java).setAction(MyraService.ACTION_STOP))
+        }
+    }
+
+    private fun pickImage() {
+        if (!MyraService.running) {
+            Toast.makeText(this, "আগে 🎤 চেপে MYRA চালু করো", Toast.LENGTH_SHORT).show(); return
+        }
+        startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).setType("image/*"), 7)
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+        super.onActivityResult(req, res, data)
+        if (req != 7 || res != RESULT_OK) return
+        val uri = data?.data ?: return
+        try {
+            val opts = BitmapFactory.Options().apply { inSampleSize = 2 }
+            contentResolver.openInputStream(uri)?.use {
+                MyraService.pendingImage = BitmapFactory.decodeStream(it, null, opts)
+            }
+            startService(Intent(this, MyraService::class.java).setAction(MyraService.ACTION_IMAGE))
+        } catch (e: Exception) {
+            Toast.makeText(this, "Image পড়া যায়নি: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
     }
 
     // ------------------------------------------------------------- settings screen
@@ -373,6 +429,9 @@ class MainActivity : Activity() {
         col.addView(button("Accessibility অন করো (screenshot/স্ক্রিন পড়ার জন্য)") {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         })
+        col.addView(button("App permissions (Phone / SMS / Contacts / Call log সব Allow করো)") {
+            startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
+        })
         col.addView(button("Display over other apps (অ্যাপ খোলার জন্য)") {
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
         })
@@ -414,6 +473,7 @@ class MainActivity : Activity() {
             if (red != lastRed) { lastRed = red; redFx.animate().alpha(red).setDuration(400).start() }
             mic.text = if (running && MyraService.mutedNow) "🔇" else "🎤"
             mic.alpha = if (running && MyraService.mutedNow) 0.5f else 1f
+            refreshAction()
             if (!running && (st.startsWith("Listening") || st.startsWith("Connecting"))) status.text = "Tap karke bolo 💬"
             if (tick % 300 == 0) updateInfo()
             tick++
@@ -449,7 +509,17 @@ class MainActivity : Activity() {
             "s" -> status.text = text
             "u" -> bubble(text, true)
             "m" -> bubble(text, false)
+            "t" -> toolLine(text)
         }
+    }
+
+    private fun toolLine(text: String) {
+        val tv = TextView(this).apply {
+            this.text = text; setTextColor(Color.parseColor("#777777")); textSize = 11f
+            typeface = Typeface.MONOSPACE; setPadding(dp(4), dp(3), dp(4), dp(3))
+        }
+        chatBox.addView(tv)
+        chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
     }
 
     private fun bubble(text: String, user: Boolean) {
