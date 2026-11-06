@@ -382,7 +382,7 @@ class OrbView(ctx: Context) : View(ctx) {
 /** Small round preview used in Settings to pick an avatar */
 class AvatarThumb(ctx: Context, val kind: String) : View(ctx) {
     var accent = 0xFFFF1744.toInt()
-    var selected = false
+    var chosen = false
     var custom: Bitmap? = null
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
 
@@ -421,9 +421,8 @@ class AvatarThumb(ctx: Context, val kind: String) : View(ctx) {
             }
         }
         p.reset(); p.isAntiAlias = true; p.style = Paint.Style.STROKE
-        p.strokeWidth = if (selected) 5f else 2f
-        p.color = if (selected) accent else 0xFF444444.toInt()
+        p.strokeWidth = if (chosen) 5f else 2f
+        p.color = if (chosen) accent else 0xFF444444.toInt()
         c.drawCircle(cx, cy, r + 2f, p)
     }
 }
-
