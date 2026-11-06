@@ -394,7 +394,7 @@ class MainActivity : Activity() {
         lastRed = -1f
         thumbs.forEach {
             it.accent = RED
-            it.selected = (it.kind == av)
+            it.chosen = (it.kind == av)
             if (it.kind == "custom") it.custom = customBmp
             it.invalidate()
         }
