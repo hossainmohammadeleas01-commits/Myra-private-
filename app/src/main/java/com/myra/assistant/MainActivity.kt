@@ -28,7 +28,15 @@ import android.provider.Settings
 import android.app.AlertDialog
 import android.app.Dialog
 import android.content.ContentValues
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.text.method.LinkMovementMethod
+import android.widget.HorizontalScrollView
+import android.widget.SeekBar
+import java.io.File
+import java.io.FileOutputStream
 import android.graphics.drawable.ColorDrawable
 import android.provider.MediaStore
 import android.speech.RecognitionListener
@@ -61,105 +69,10 @@ import kotlin.math.sin
 
 private fun withAlpha(c: Int, a: Int) = (c and 0x00FFFFFF) or (a.coerceIn(0, 255) shl 24)
 
-/** Animated orb (idle / listening / speaking / thinking) */
-class OrbView(ctx: Context) : View(ctx) {
-    var state = "idle"
-    private var amp = 0f
-    private var t = 0f
-    private val p = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val rect = RectF()
-    private val path = Path()
-
-    private fun cols(): Pair<Int, Int> = when (state) {
-        "listening" -> Color.parseColor("#FF1744") to Color.parseColor("#D500F9")
-        "speaking" -> Color.parseColor("#E040FB") to Color.parseColor("#FF1744")
-        "thinking" -> Color.parseColor("#40C4FF") to Color.parseColor("#00B0FF")
-        else -> Color.parseColor("#B71C1C") to Color.parseColor("#880E4F")
-    }
-
-    override fun onDraw(c: Canvas) {
-        t += 0.016f
-        val target = when (state) {
-            "speaking" -> 0.35f + 0.35f * abs(sin(t * 6f))
-            "listening" -> MyraService.level
-            else -> 0f
-        }
-        amp += (target - amp) * 0.25f
-        val (c1, c2) = cols()
-        val cx = width / 2f
-        val cy = height / 2f
-        val base = min(width, height) / 2f
-        val act = state != "idle"
-        val pulse = if (state == "idle") 1f + 0.075f * sin(t * 4.19f) else 1f + amp * 0.2f
-        val r = base * 0.48f * pulse
-
-        // glow
-        p.reset(); p.isAntiAlias = true
-        p.shader = RadialGradient(cx, cy, r * 1.6f, intArrayOf(withAlpha(c1, if (act) 140 else 90), withAlpha(c1, 0)), null, Shader.TileMode.CLAMP)
-        c.drawCircle(cx, cy, r * 1.6f, p)
-        // core
-        p.reset(); p.isAntiAlias = true
-        p.shader = RadialGradient(cx - r * 0.3f, cy - r * 0.3f, r * 1.3f, intArrayOf(c2, c1), null, Shader.TileMode.CLAMP)
-        c.drawCircle(cx, cy, r, p)
-        // rings
-        for (i in 0 until 3) {
-            p.reset(); p.isAntiAlias = true
-            p.style = Paint.Style.STROKE; p.strokeWidth = 3f
-            p.color = withAlpha(c2, 140 - i * 30)
-            p.pathEffect = DashPathEffect(floatArrayOf(28f, 20f), 0f)
-            val rr = r * (1.2f + i * 0.14f)
-            rect.set(cx - rr, cy - rr, cx + rr, cy + rr)
-            c.save()
-            val dir = if (i % 2 == 0) 1f else -1f
-            c.rotate(Math.toDegrees((t * (if (act) 1f else 0.3f) * (0.6f + i * 0.35f) * dir).toDouble()).toFloat(), cx, cy)
-            c.drawArc(rect, 0f, 290f, false, p)
-            c.restore()
-        }
-        // wave ring
-        if (act && state != "thinking") {
-            p.reset(); p.isAntiAlias = true
-            p.style = Paint.Style.STROKE; p.strokeWidth = 3f; p.color = withAlpha(c1, 180)
-            path.reset()
-            val spd = if (state == "speaking") 7f else 4f
-            for (i in 0..120) {
-                val a = i / 120f * 2f * PI.toFloat()
-                val rr = r * 1.1f + sin(a * 6f + t * spd) * (6f + amp * 28f)
-                val x = cx + cos(a) * rr
-                val y = cy + sin(a) * rr
-                if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
-            }
-            c.drawPath(path, p)
-            // particles
-            p.reset(); p.isAntiAlias = true; p.color = withAlpha(c2, 230)
-            for (i in 0 until 12) {
-                val a = t * (0.8f + amp) + i / 12f * 2f * PI.toFloat()
-                val rr = r * 1.55f + sin(t * 2f + i) * 10f * (1f + amp * 2f)
-                c.drawCircle(cx + cos(a) * rr, cy + sin(a) * rr, 4f + amp * 4f, p)
-            }
-        }
-        // thinking arcs
-        if (state == "thinking") {
-            p.reset(); p.isAntiAlias = true; p.style = Paint.Style.STROKE; p.strokeWidth = 8f
-            p.color = c1
-            var rr = r * 1.3f
-            rect.set(cx - rr, cy - rr, cx + rr, cy + rr)
-            c.drawArc(rect, Math.toDegrees((t * 4f).toDouble()).toFloat(), 140f, false, p)
-            p.color = c2
-            rr = r * 1.45f
-            rect.set(cx - rr, cy - rr, cx + rr, cy + rr)
-            c.drawArc(rect, Math.toDegrees((-t * 3f).toDouble()).toFloat(), 110f, false, p)
-        }
-        // highlight
-        p.reset(); p.isAntiAlias = true
-        p.shader = RadialGradient(cx - r * 0.4f, cy - r * 0.4f, r * 0.6f, intArrayOf(withAlpha(Color.WHITE, 90), withAlpha(Color.WHITE, 0)), null, Shader.TileMode.CLAMP)
-        c.drawCircle(cx, cy, r, p)
-        postInvalidateOnAnimation()
-    }
-}
-
 /** 20-bar waveform */
 class WaveView(ctx: Context) : View(ctx) {
     var active = false
+    var color = Color.parseColor("#FF1744")
     private val bars = FloatArray(20) { 0.05f }
     private var t = 0f
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -172,7 +85,7 @@ class WaveView(ctx: Context) : View(ctx) {
             val tg = if (active && lvl > 0.02f) 0.12f + lvl * 0.88f * (0.4f + 0.6f * abs(sin(t * 6f + i * 0.9f))) else 0.05f
             bars[i] += (tg - bars[i]) * 0.3f
             val h = (bars[i] * height).coerceAtLeast(4f)
-            p.color = withAlpha(Color.parseColor("#FF1744"), (150 + bars[i] * 105).toInt())
+            p.color = withAlpha(color, (150 + bars[i] * 105).toInt())
             c.drawRoundRect(i * w + w * 0.2f, (height - h) / 2f, i * w + w * 0.8f, (height + h) / 2f, 4f, 4f, p)
         }
         postInvalidateOnAnimation()
@@ -216,6 +129,10 @@ class MainActivity : Activity() {
     private lateinit var hintTv: TextView
     private lateinit var modeBtn: TextView
     private lateinit var dictSp: Spinner
+    private val thumbs = mutableListOf<AvatarThumb>()
+    private var customBmp: Bitmap? = null
+    private val chatLog = StringBuilder()
+    private val swatches = listOf("#FF1744", "#FF4081", "#E040FB", "#7C4DFF", "#40C4FF", "#00E676", "#FFEA00", "#FF9100", "#FFFFFF")
     private var recognizer: SpeechRecognizer? = null
     private var dictating = false
     private var dictBase = ""
@@ -252,7 +169,7 @@ class MainActivity : Activity() {
     private val pers = listOf("gf", "pro", "asst")
     private val persLabels = listOf("GF (Hinglish)", "Professional", "Assistant")
 
-    private val RED = Color.parseColor("#FF1744")
+    private var RED = Color.parseColor("#FF1744")
     private val BG = Color.parseColor("#050505")
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -281,6 +198,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("myra", MODE_PRIVATE)
+        try { RED = Color.parseColor(prefs.getString("theme", "#FF1744")) } catch (_: Exception) {}
         window.statusBarColor = BG; window.navigationBarColor = BG
 
         val root = FrameLayout(this).apply { setBackgroundColor(BG) }
@@ -293,6 +211,11 @@ class MainActivity : Activity() {
         root.addView(settingsView, FrameLayout.LayoutParams(-1, -1))
         settingsView.visibility = View.GONE
         setContentView(root)
+        applyAppearance()
+        if (prefs.getBoolean("reopen", false)) {
+            prefs.edit().putBoolean("reopen", false).apply()
+            showSettings(true)
+        }
     }
 
     // ------------------------------------------------------------- main screen
@@ -324,10 +247,14 @@ class MainActivity : Activity() {
             text = "🔴"; textSize = 18f; setPadding(dp(10), 0, 0, 0)
             setOnClickListener { toggleDisplayMode() }
         }
-        right.addView(clock); right.addView(modeBtn); right.addView(gear)
-        top.addView(batt, LinearLayout.LayoutParams(0, -2, 1f))
-        top.addView(titleBox, LinearLayout.LayoutParams(0, -2, 1.3f))
-        top.addView(right, LinearLayout.LayoutParams(0, -2, 1.3f))
+        val copyBtn = TextView(this).apply {
+            text = "\uD83D\uDCCB"; textSize = 18f; setPadding(dp(8), 0, 0, 0)
+            setOnClickListener { copyAll() }
+        }
+        right.addView(clock); right.addView(copyBtn); right.addView(modeBtn); right.addView(gear)
+        top.addView(batt, LinearLayout.LayoutParams(0, -2, 0.8f))
+        top.addView(titleBox, LinearLayout.LayoutParams(0, -2, 1.1f))
+        top.addView(right, LinearLayout.LayoutParams(0, -2, 1.7f))
         mainView.addView(top)
 
         // chat (sits ABOVE the orb)
@@ -448,6 +375,68 @@ class MainActivity : Activity() {
         }
         mic.alpha = if (muted) 0.5f else 1f
         (mic.background as? GradientDrawable)?.setColor(Color.parseColor(if (dictating) "#FF1744" else "#232323"))
+    }
+
+    private fun applyAppearance() {
+        val av = prefs.getString("avatar", "g0") ?: "g0"
+        if (av == "custom" && customBmp == null) {
+            val f = File(filesDir, "avatar.jpg")
+            if (f.exists()) customBmp = BitmapFactory.decodeFile(f.path)
+        }
+        orb.accent = RED
+        orb.avatar = if (av == "custom" && customBmp == null) "g0" else av
+        orb.custom = customBmp
+        wave.color = RED
+        redFx.setBackgroundColor(RED)
+        lastRed = -1f
+        thumbs.forEach {
+            it.accent = RED
+            it.selected = (it.kind == av)
+            if (it.kind == "custom") it.custom = customBmp
+            it.invalidate()
+        }
+    }
+
+    private fun selectAvatar(kind: String) {
+        if (kind == "custom" && !File(filesDir, "avatar.jpg").exists()) { pickFile("image/*", 10); return }
+        prefs.edit().putString("avatar", kind).apply()
+        applyAppearance()
+        toast("Avatar সেট ✓")
+    }
+
+    private fun saveCustomAvatar(uri: Uri) {
+        try {
+            val opts = BitmapFactory.Options().apply { inSampleSize = 2 }
+            val bmp = contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) } ?: return
+            val side = minOf(bmp.width, bmp.height)
+            val sq = Bitmap.createBitmap(bmp, (bmp.width - side) / 2, (bmp.height - side) / 2, side, side)
+            val out = Bitmap.createScaledBitmap(sq, 512, 512, true)
+            FileOutputStream(File(filesDir, "avatar.jpg")).use { out.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+            customBmp = out
+            prefs.edit().putString("avatar", "custom").apply()
+            applyAppearance()
+            toast("তোমার ছবি avatar হয়েছে ✓")
+        } catch (e: Exception) { toast("ছবি সেট করা যায়নি: ${e.message}") }
+    }
+
+    private fun applyThemeColor(hex: String) {
+        val h = if (hex.startsWith("#")) hex else "#$hex"
+        try { Color.parseColor(h) } catch (_: Exception) { toast("রঙ ঠিক নেই (যেমন #00BCD4)"); return }
+        prefs.edit().putString("theme", h).putBoolean("reopen", true).apply()
+        recreate()
+    }
+
+    private fun copyAll() {
+        if (chatLog.isEmpty()) { toast("কপি করার মতো লেখা নেই"); return }
+        val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("MYRA chat", chatLog.toString().trim()))
+        toast("সব লেখা কপি হয়েছে ✓")
+    }
+
+    private fun copyText(t: String) {
+        val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("MYRA", t))
+        toast("কপি হয়েছে ✓")
     }
 
     private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_SHORT).show()
@@ -669,6 +658,7 @@ class MainActivity : Activity() {
             7 -> data?.data?.let { sendImageUri(it) }
             8 -> cameraUri?.let { sendImageUri(it) }
             9 -> data?.data?.let { handleFile(it) }
+            10 -> data?.data?.let { saveCustomAvatar(it) }
         }
     }
 
@@ -741,6 +731,57 @@ class MainActivity : Activity() {
         col.addView(label("DICTATION LANGUAGE (🎤 দিয়ে লেখার ভাষা)")); col.addView(dictSp)
         col.addView(button("SAVE", RED) { save(); showSettings(false) },
             LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
+        // ---- appearance
+        col.addView(label("AVATAR (লাল orb-এর জায়গায় — চাপো; নিজের ছবির জন্য শেষেরটা চাপো, বদলাতে লং-প্রেস)"))
+        val hs = HorizontalScrollView(this)
+        val trow = LinearLayout(this)
+        trow.orientation = LinearLayout.HORIZONTAL
+        thumbs.clear()
+        for (k in listOf("g0", "g1", "g2", "g3", "orb", "custom")) {
+            val th = AvatarThumb(this, k)
+            th.setOnClickListener { selectAvatar(k) }
+            if (k == "custom") th.setOnLongClickListener { pickFile("image/*", 10); true }
+            thumbs.add(th)
+            trow.addView(th, LinearLayout.LayoutParams(dp(72), dp(72)).apply { rightMargin = dp(8) })
+        }
+        hs.addView(trow)
+        col.addView(hs)
+
+        col.addView(label("THEME COLOR (ব্যাকগ্রাউন্ড / orb / বাটনের রঙ)"))
+        val sw = LinearLayout(this)
+        sw.orientation = LinearLayout.HORIZONTAL
+        val swScroll = HorizontalScrollView(this)
+        for (hex in swatches) {
+            val v = View(this)
+            v.background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL; setColor(Color.parseColor(hex)); setStroke(dp(1), Color.parseColor("#555555"))
+            }
+            v.setOnClickListener { applyThemeColor(hex) }
+            sw.addView(v, LinearLayout.LayoutParams(dp(40), dp(40)).apply { rightMargin = dp(10) })
+        }
+        swScroll.addView(sw)
+        col.addView(swScroll)
+        val hexRow = LinearLayout(this)
+        hexRow.orientation = LinearLayout.HORIZONTAL
+        val hexEt = edit("যেকোনো রঙ, যেমন #00BCD4 বা #FF5722")
+        hexRow.addView(hexEt, LinearLayout.LayoutParams(0, -2, 1f))
+        hexRow.addView(button("APPLY") { applyThemeColor(hexEt.text.toString().trim()) },
+            LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(8) })
+        col.addView(hexRow, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+
+        col.addView(label("SCREEN COLOR STRENGTH (orb-only স্ক্রিন কতটা উজ্জ্বল হবে)"))
+        val sb = SeekBar(this)
+        sb.max = 100
+        sb.progress = prefs.getInt("bg_alpha", 85)
+        sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, v: Int, u: Boolean) {
+                prefs.edit().putInt("bg_alpha", v.coerceAtLeast(10)).apply()
+            }
+            override fun onStartTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) {}
+        })
+        col.addView(sb)
+
         col.addView(label("PERMISSIONS (ব্যাকগ্রাউন্ডে ভালো চলার জন্য)"))
         col.addView(button("Accessibility অন করো (screenshot/স্ক্রিন পড়ার জন্য)") {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
@@ -786,7 +827,8 @@ class MainActivity : Activity() {
             }
             wave.active = running
             val orbOnly = prefs.getString("display_mode", "chat") == "orb"
-            val red = if (orbOnly) (if (running) 0.6f else 0.25f) else if (running) 0.08f else 0f
+            val base = prefs.getInt("bg_alpha", 85) / 100f
+            val red = if (orbOnly) (if (running) base else base * 0.5f) else if (running) 0.10f else 0f
             if (red != lastRed) { lastRed = red; redFx.animate().alpha(red).setDuration(400).start() }
             refreshMic()
             refreshAction()
@@ -807,7 +849,7 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        chatBox.removeAllViews(); lastBubble = ""; layoutKey = ""
+        chatBox.removeAllViews(); lastBubble = ""; layoutKey = ""; chatLog.setLength(0)
         MyraService.log.forEach { onEvent(it.first, it.second) }
         applyLayout()
         MyraService.listener = { k, t -> runOnUiThread { onEvent(k, t) } }
@@ -834,6 +876,7 @@ class MainActivity : Activity() {
         val tv = TextView(this).apply {
             this.text = text; setTextColor(Color.parseColor("#777777")); textSize = 11f
             typeface = Typeface.MONOSPACE; setPadding(dp(4), dp(3), dp(4), dp(3))
+            setTextIsSelectable(true)
         }
         chatBox.addView(tv)
         applyLayout()
@@ -853,7 +896,13 @@ class MainActivity : Activity() {
                 else setColor(Color.parseColor("#1c1c1c"))
             }
         }
-        if (text.contains("http")) { Linkify.addLinks(tv, Linkify.WEB_URLS); tv.setLinkTextColor(RED) }
+        tv.setTextIsSelectable(true)
+        if (text.contains("http")) {
+            Linkify.addLinks(tv, Linkify.WEB_URLS); tv.setLinkTextColor(RED)
+            tv.movementMethod = LinkMovementMethod.getInstance()
+            tv.setOnLongClickListener { copyText(text); true }
+        }
+        chatLog.append(if (user) "You: " else "MYRA: ").append(text).append("\n\n")
         val lp = LinearLayout.LayoutParams(-2, -2).apply {
             topMargin = dp(5); gravity = if (user) Gravity.END else Gravity.START
         }
