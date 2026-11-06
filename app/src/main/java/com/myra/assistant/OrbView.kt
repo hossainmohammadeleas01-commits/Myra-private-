@@ -230,8 +230,10 @@ fun drawGirl(c: Canvas, cx: Float, cy: Float, r: Float, st: GirlStyle, mouth: Fl
 class OrbView(ctx: Context) : View(ctx) {
     var state = "idle"
     var accent = 0xFFFF1744.toInt()
-    var avatar = "g0"          // "orb" | "g0".."g3" | "custom"
+    var avatar = "orb"         // "orb" | "g0".."g3" | "custom"
     var custom: Bitmap? = null
+    var mouthX = 0.5f          // where the mouth is on the photo (0..1)
+    var mouthY = 0.72f
     private var amp = 0f
     private var t = 0f
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -277,11 +279,33 @@ class OrbView(ctx: Context) : View(ctx) {
             c.save()
             path.reset(); path.addCircle(cx, cy, r, Path.Direction.CW)
             c.clipPath(path)
-            val zoom = 1f + amp * 0.07f
+            val zoom = 1f + amp * 0.02f
             val s = max(2f * r / bmp.width, 2f * r / bmp.height) * zoom
             c.translate(cx, cy); c.scale(s, s)
+            val bw = bmp.width.toFloat()
+            val bh = bmp.height.toFloat()
+            val l = -bw / 2f
+            val tp = -bh / 2f
             p.reset(); p.isAntiAlias = true; p.isFilterBitmap = true
-            c.drawBitmap(bmp, -bmp.width / 2f, -bmp.height / 2f, p)
+            c.drawBitmap(bmp, l, tp, p)
+            // talking: the lower face drops a little, a dark mouth opening shows
+            if (state == "speaking") {
+                val mouth = ((0.25f + 0.75f * abs(sin(t * 11f))) * (0.45f + amp)).coerceIn(0f, 1f)
+                val d = bh * 0.03f * mouth
+                if (d > 0.8f) {
+                    val mx = l + bw * mouthX
+                    val my = tp + bh * mouthY
+                    val mw = bw * 0.075f
+                    p.reset(); p.isAntiAlias = true; p.color = 0xFF2A0610.toInt()
+                    c.drawOval(mx - mw, my - d * 0.25f, mx + mw, my + d, p)
+                    c.save()
+                    c.clipRect(l, my + d, l + bw, tp + bh + d)
+                    c.translate(0f, d)
+                    p.reset(); p.isAntiAlias = true; p.isFilterBitmap = true
+                    c.drawBitmap(bmp, l, tp, p)
+                    c.restore()
+                }
+            }
             c.restore()
         } else {
             val idx = avatar.removePrefix("g").toIntOrNull()?.coerceIn(0, GIRLS.size - 1) ?: 0
@@ -402,3 +426,4 @@ class AvatarThumb(ctx: Context, val kind: String) : View(ctx) {
         c.drawCircle(cx, cy, r + 2f, p)
     }
 }
+
