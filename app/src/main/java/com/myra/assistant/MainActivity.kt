@@ -34,6 +34,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.text.method.LinkMovementMethod
 import android.widget.HorizontalScrollView
+import android.widget.ImageView
 import android.widget.SeekBar
 import java.io.File
 import java.io.FileOutputStream
@@ -378,14 +379,16 @@ class MainActivity : Activity() {
     }
 
     private fun applyAppearance() {
-        val av = prefs.getString("avatar", "g0") ?: "g0"
+        val av = prefs.getString("avatar", "orb") ?: "orb"
         if (av == "custom" && customBmp == null) {
             val f = File(filesDir, "avatar.jpg")
             if (f.exists()) customBmp = BitmapFactory.decodeFile(f.path)
         }
         orb.accent = RED
-        orb.avatar = if (av == "custom" && customBmp == null) "g0" else av
+        orb.avatar = if (av == "custom" && customBmp == null) "orb" else av
         orb.custom = customBmp
+        orb.mouthX = prefs.getFloat("mouth_x", 0.5f)
+        orb.mouthY = prefs.getFloat("mouth_y", 0.72f)
         wave.color = RED
         redFx.setBackgroundColor(RED)
         lastRed = -1f
@@ -416,7 +419,54 @@ class MainActivity : Activity() {
             prefs.edit().putString("avatar", "custom").apply()
             applyAppearance()
             toast("তোমার ছবি avatar হয়েছে ✓")
+            calibrateMouth()
         } catch (e: Exception) { toast("ছবি সেট করা যায়নি: ${e.message}") }
+    }
+
+    private fun calibrateMouth() {
+        val bmp = customBmp
+        if (bmp == null) { toast("আগে নিজের ছবি দাও (প্রথম ঘর)"); return }
+        val d = Dialog(this)
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val size = dp(300)
+        val ms = dp(36)
+        val box = FrameLayout(this)
+        val iv = ImageView(this)
+        iv.setImageBitmap(bmp)
+        iv.scaleType = ImageView.ScaleType.FIT_XY
+        box.addView(iv, FrameLayout.LayoutParams(size, size))
+        val marker = View(this)
+        marker.background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL; setStroke(dp(3), RED); setColor(Color.parseColor("#33FFFFFF"))
+        }
+        box.addView(marker, FrameLayout.LayoutParams(ms, ms))
+        var fx = prefs.getFloat("mouth_x", 0.5f)
+        var fy = prefs.getFloat("mouth_y", 0.72f)
+        fun place() {
+            marker.translationX = fx * size - ms / 2f
+            marker.translationY = fy * size - ms / 2f
+        }
+        place()
+        iv.setOnTouchListener { _, e ->
+            fx = (e.x / size).coerceIn(0f, 1f)
+            fy = (e.y / size).coerceIn(0f, 1f)
+            place(); true
+        }
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(dp(16), dp(16), dp(16), dp(16))
+        col.setBackgroundColor(Color.parseColor("#1a1a1a"))
+        col.addView(TextView(this).apply {
+            text = "ছবিতে ঠোঁটের ঠিক মাঝখানে চাপো"; setTextColor(Color.WHITE); textSize = 15f
+            setPadding(0, 0, 0, dp(10))
+        })
+        col.addView(box, LinearLayout.LayoutParams(size, size))
+        col.addView(button("SAVE", RED) {
+            prefs.edit().putFloat("mouth_x", fx).putFloat("mouth_y", fy).apply()
+            applyAppearance(); d.dismiss(); toast("Saved ✓")
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+        d.setContentView(col)
+        d.show()
     }
 
     private fun applyThemeColor(hex: String) {
@@ -732,12 +782,12 @@ class MainActivity : Activity() {
         col.addView(button("SAVE", RED) { save(); showSettings(false) },
             LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
         // ---- appearance
-        col.addView(label("AVATAR (লাল orb-এর জায়গায় — চাপো; নিজের ছবির জন্য শেষেরটা চাপো, বদলাতে লং-প্রেস)"))
+        col.addView(label("AVATAR — প্রথম ঘরটা তোমার নিজের ছবি (চাপো; বদলাতে লং-প্রেস)"))
         val hs = HorizontalScrollView(this)
         val trow = LinearLayout(this)
         trow.orientation = LinearLayout.HORIZONTAL
         thumbs.clear()
-        for (k in listOf("g0", "g1", "g2", "g3", "orb", "custom")) {
+        for (k in listOf("custom", "orb", "g0", "g1", "g2", "g3")) {
             val th = AvatarThumb(this, k)
             th.setOnClickListener { selectAvatar(k) }
             if (k == "custom") th.setOnLongClickListener { pickFile("image/*", 10); true }
@@ -746,6 +796,8 @@ class MainActivity : Activity() {
         }
         hs.addView(trow)
         col.addView(hs)
+        col.addView(button("\uD83D\uDC44 ছবিতে মুখ কোথায় সেট করো (কথা বললে মুখ নড়বে)") { calibrateMouth() },
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
 
         col.addView(label("THEME COLOR (ব্যাকগ্রাউন্ড / orb / বাটনের রঙ)"))
         val sw = LinearLayout(this)
