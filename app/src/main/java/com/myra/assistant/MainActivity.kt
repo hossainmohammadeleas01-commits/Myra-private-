@@ -35,6 +35,12 @@ import android.graphics.BitmapFactory
 import android.text.method.LinkMovementMethod
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
+import android.widget.VideoView
+import android.graphics.ImageDecoder
+import android.graphics.drawable.AnimatedImageDrawable
+import android.graphics.drawable.Drawable
+import android.media.AudioManager
+import android.media.MediaMetadataRetriever
 import android.widget.SeekBar
 import java.io.File
 import java.io.FileOutputStream
@@ -133,6 +139,12 @@ class MainActivity : Activity() {
     private val thumbs = mutableListOf<AvatarThumb>()
     private var customBmp: Bitmap? = null
     private val chatLog = StringBuilder()
+    private lateinit var aura: AuraView
+    private lateinit var mediaImage: ImageView
+    private lateinit var mediaVideo: VideoView
+    private var mediaMode = false
+    private var mediaThumb: Bitmap? = null
+    private var mediaLoaded = ""
     private val swatches = listOf("#FF1744", "#FF4081", "#E040FB", "#7C4DFF", "#40C4FF", "#00E676", "#FFEA00", "#FF9100", "#FFFFFF")
     private var recognizer: SpeechRecognizer? = null
     private var dictating = false
@@ -205,6 +217,15 @@ class MainActivity : Activity() {
         val root = FrameLayout(this).apply { setBackgroundColor(BG) }
         redFx = View(this).apply { setBackgroundColor(RED); alpha = 0f }
         root.addView(redFx, FrameLayout.LayoutParams(-1, -1))
+        aura = AuraView(this)
+        aura.visibility = View.GONE
+        root.addView(aura, FrameLayout.LayoutParams(-1, -1))
+        mediaImage = ImageView(this)
+        mediaImage.visibility = View.GONE
+        root.addView(mediaImage, FrameLayout.LayoutParams(-1, -1))
+        mediaVideo = VideoView(this)
+        mediaVideo.visibility = View.GONE
+        root.addView(mediaVideo, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
 
         buildMain()
         buildSettings()
@@ -343,12 +364,13 @@ class MainActivity : Activity() {
     private fun applyLayout() {
         val orbOnly = prefs.getString("display_mode", "chat") == "orb"
         val hasChat = chatBox.childCount > 0
-        val key = "$orbOnly-$hasChat"
+        val key = "$orbOnly-$hasChat-$mediaMode"
         if (key == layoutKey) return
         layoutKey = key
         val big = orbOnly || !hasChat
         val o = dp(if (orbOnly) 300 else if (big) 260 else 120)
         orb.layoutParams = LinearLayout.LayoutParams(o, o)
+        orb.visibility = if (mediaMode) View.GONE else View.VISIBLE
         wave.layoutParams = LinearLayout.LayoutParams(dp(if (big) 200 else 140), dp(if (big) 40 else 22))
         chatScroll.visibility = if (orbOnly || !hasChat) View.GONE else View.VISIBLE
         centerBox.layoutParams =
@@ -385,7 +407,14 @@ class MainActivity : Activity() {
             if (f.exists()) customBmp = BitmapFactory.decodeFile(f.path)
         }
         orb.accent = RED
-        orb.avatar = if (av == "custom" && customBmp == null) "orb" else av
+        mediaMode = (av == "media" && mediaExists())
+        orb.avatar = if ((av == "custom" && customBmp == null) || av == "media") "orb" else av
+        aura.accent = RED
+        if (mediaMode) { mediaThumb = loadMediaThumb(); applyMedia() } else stopMedia()
+        status.setTextColor(if (mediaMode) Color.WHITE else Color.parseColor("#777777"))
+        status.setShadowLayer(if (mediaMode) 8f else 0f, 0f, 0f, Color.BLACK)
+        layoutKey = ""
+        applyLayout()
         orb.custom = customBmp
         orb.mouthX = prefs.getFloat("mouth_x", 0.5f)
         orb.mouthY = prefs.getFloat("mouth_y", 0.72f)
@@ -396,12 +425,112 @@ class MainActivity : Activity() {
             it.accent = RED
             it.chosen = (it.kind == av)
             if (it.kind == "custom") it.custom = customBmp
+            if (it.kind == "media") it.custom = if (mediaExists()) (mediaThumb ?: loadMediaThumb().also { b -> mediaThumb = b }) else null
             it.invalidate()
         }
     }
 
+    // ---- full-screen photo / GIF / video
+    private fun mediaFile(): File =
+        File(filesDir, if (prefs.getString("media_type", "image") == "video") "media_video" else "media_image")
+
+    private fun mediaExists() = mediaFile().exists()
+
+    private fun loadMediaThumb(): Bitmap? = try {
+        val f = mediaFile()
+        if (!f.exists()) null
+        else if (prefs.getString("media_type", "image") == "video") {
+            val r = MediaMetadataRetriever()
+            r.setDataSource(f.path)
+            val b = r.getFrameAtTime(0)
+            r.release(); b
+        } else BitmapFactory.decodeFile(f.path, BitmapFactory.Options().apply { inSampleSize = 4 })
+    } catch (e: Exception) { null }
+
+    private fun stopMedia() {
+        aura.visibility = View.GONE
+        mediaImage.visibility = View.GONE
+        try { mediaVideo.stopPlayback() } catch (_: Exception) {}
+        mediaVideo.visibility = View.GONE
+        mediaLoaded = ""
+    }
+
+    private fun applyMedia() {
+        aura.visibility = View.VISIBLE
+        val f = mediaFile()
+        if (prefs.getString("media_type", "image") == "video") {
+            mediaImage.visibility = View.GONE
+            mediaVideo.visibility = View.VISIBLE
+            val id = "v:" + f.lastModified()
+            if (mediaLoaded != id) {
+                mediaLoaded = id
+                try {
+                    mediaVideo.setAudioFocusRequest(AudioManager.AUDIOFOCUS_NONE)
+                    mediaVideo.setVideoPath(f.path)
+                    mediaVideo.setOnPreparedListener { mp ->
+                        mp.isLooping = true
+                        mp.setVolume(0f, 0f)
+                        mediaVideo.start()
+                    }
+                } catch (e: Exception) { toast("Video চালানো যায়নি: ${e.message}") }
+            } else mediaVideo.start()
+        } else {
+            try { mediaVideo.stopPlayback() } catch (_: Exception) {}
+            mediaVideo.visibility = View.GONE
+            mediaLoaded = ""
+            mediaImage.visibility = View.VISIBLE
+            mediaImage.scaleType =
+                if (prefs.getBoolean("media_fill", false)) ImageView.ScaleType.CENTER_CROP else ImageView.ScaleType.FIT_CENTER
+            var d: Drawable? = null
+            if (Build.VERSION.SDK_INT >= 28) {
+                try {
+                    d = ImageDecoder.decodeDrawable(ImageDecoder.createSource(f)) { dec, _, _ -> dec.setTargetSampleSize(2) }
+                    if (d is AnimatedImageDrawable) {
+                        d.repeatCount = AnimatedImageDrawable.REPEAT_INFINITE
+                        d.start()
+                    }
+                } catch (_: Exception) { d = null }
+            }
+            if (d != null) mediaImage.setImageDrawable(d)
+            else mediaImage.setImageBitmap(BitmapFactory.decodeFile(f.path, BitmapFactory.Options().apply { inSampleSize = 2 }))
+        }
+    }
+
+    private fun pickMedia() {
+        startActivityForResult(
+            Intent(Intent.ACTION_GET_CONTENT).setType("*/*")
+                .putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "video/*")), 11
+        )
+    }
+
+    private fun saveMedia(uri: Uri) {
+        try {
+            val mime = contentResolver.getType(uri) ?: ""
+            val isVideo = mime.startsWith("video/")
+            File(filesDir, "media_video").delete()
+            File(filesDir, "media_image").delete()
+            val dst = File(filesDir, if (isVideo) "media_video" else "media_image")
+            contentResolver.openInputStream(uri)?.use { i -> FileOutputStream(dst).use { o -> i.copyTo(o) } }
+            prefs.edit().putString("avatar", "media")
+                .putString("media_type", if (isVideo) "video" else "image").apply()
+            mediaThumb = null
+            if (isVideo) {
+                try {
+                    val r = MediaMetadataRetriever()
+                    r.setDataSource(dst.path)
+                    val ms = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                    r.release()
+                    if (ms > 40000L) toast("ভিডিও ${ms / 1000} সেকেন্ডের — ৩০ সেকেন্ডের কাছাকাছি হলে ভালো")
+                } catch (_: Exception) {}
+            }
+            applyAppearance()
+            toast("ফুল স্ক্রিন media সেট ✓")
+        } catch (e: Exception) { toast("Media সেট করা যায়নি: ${e.message}") }
+    }
+
     private fun selectAvatar(kind: String) {
         if (kind == "custom" && !File(filesDir, "avatar.jpg").exists()) { pickFile("image/*", 10); return }
+        if (kind == "media" && !mediaExists()) { pickMedia(); return }
         prefs.edit().putString("avatar", kind).apply()
         applyAppearance()
         toast("Avatar সেট ✓")
@@ -709,6 +838,7 @@ class MainActivity : Activity() {
             8 -> cameraUri?.let { sendImageUri(it) }
             9 -> data?.data?.let { handleFile(it) }
             10 -> data?.data?.let { saveCustomAvatar(it) }
+            11 -> data?.data?.let { saveMedia(it) }
         }
     }
 
@@ -782,15 +912,16 @@ class MainActivity : Activity() {
         col.addView(button("SAVE", RED) { save(); showSettings(false) },
             LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
         // ---- appearance
-        col.addView(label("AVATAR — প্রথম ঘরটা তোমার নিজের ছবি (চাপো; বদলাতে লং-প্রেস)"))
+        col.addView(label("AVATAR — ১ম: তোমার ছবি (গোল) • ২য় ▶: ছবি/GIF/ভিডিও ফুল স্ক্রিন • বদলাতে লং-প্রেস"))
         val hs = HorizontalScrollView(this)
         val trow = LinearLayout(this)
         trow.orientation = LinearLayout.HORIZONTAL
         thumbs.clear()
-        for (k in listOf("custom", "orb", "g0", "g1", "g2", "g3")) {
+        for (k in listOf("custom", "media", "orb", "g0", "g1", "g2", "g3")) {
             val th = AvatarThumb(this, k)
             th.setOnClickListener { selectAvatar(k) }
             if (k == "custom") th.setOnLongClickListener { pickFile("image/*", 10); true }
+            if (k == "media") th.setOnLongClickListener { pickMedia(); true }
             thumbs.add(th)
             trow.addView(th, LinearLayout.LayoutParams(dp(72), dp(72)).apply { rightMargin = dp(8) })
         }
@@ -798,6 +929,11 @@ class MainActivity : Activity() {
         col.addView(hs)
         col.addView(button("\uD83D\uDC44 ছবিতে মুখ কোথায় সেট করো (কথা বললে মুখ নড়বে)") { calibrateMouth() },
             LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        col.addView(button("\uD83C\uDFAC ফুল স্ক্রিন media: Fit \u2194 Fill (শুধু ছবির জন্য)") {
+            prefs.edit().putBoolean("media_fill", !prefs.getBoolean("media_fill", false)).apply()
+            applyAppearance()
+            toast(if (prefs.getBoolean("media_fill", false)) "Fill (পুরো স্ক্রিন ভরবে)" else "Fit (পুরো ছবি দেখাবে)")
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
 
         col.addView(label("THEME COLOR (ব্যাকগ্রাউন্ড / orb / বাটনের রঙ)"))
         val sw = LinearLayout(this)
@@ -880,7 +1016,7 @@ class MainActivity : Activity() {
             wave.active = running
             val orbOnly = prefs.getString("display_mode", "chat") == "orb"
             val base = prefs.getInt("bg_alpha", 85) / 100f
-            val red = if (orbOnly) (if (running) base else base * 0.5f) else if (running) 0.10f else 0f
+            val red = if (mediaMode) 0f else if (orbOnly) (if (running) base else base * 0.5f) else if (running) 0.10f else 0f
             if (red != lastRed) { lastRed = red; redFx.animate().alpha(red).setDuration(400).start() }
             refreshMic()
             refreshAction()
@@ -906,12 +1042,14 @@ class MainActivity : Activity() {
         applyLayout()
         MyraService.listener = { k, t -> runOnUiThread { onEvent(k, t) } }
         updateInfo()
+        try { if (mediaMode && prefs.getString("media_type", "image") == "video") mediaVideo.start() } catch (_: Exception) {}
         handler.removeCallbacks(ticker); handler.post(ticker)
     }
 
     override fun onPause() {
         MyraService.listener = null
         handler.removeCallbacks(ticker)
+        try { if (mediaMode) mediaVideo.pause() } catch (_: Exception) {}
         super.onPause()
     }
 
