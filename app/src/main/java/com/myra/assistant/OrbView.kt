@@ -8,6 +8,8 @@ import android.graphics.DashPathEffect
 import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
 import android.graphics.RadialGradient
 import android.graphics.RectF
 import android.graphics.Shader
@@ -397,7 +399,7 @@ class AvatarThumb(ctx: Context, val kind: String) : View(ctx) {
                     intArrayOf(hueShift(accent, 50f), accent), null, Shader.TileMode.CLAMP)
                 c.drawCircle(cx, cy, r, p)
             }
-            kind == "custom" -> {
+            kind == "custom" || kind == "media" -> {
                 val bmp = custom
                 if (bmp != null) {
                     c.save()
@@ -412,7 +414,7 @@ class AvatarThumb(ctx: Context, val kind: String) : View(ctx) {
                     p.reset(); p.isAntiAlias = true; p.color = 0xFF262626.toInt()
                     c.drawCircle(cx, cy, r, p)
                     p.color = Color.WHITE; p.textSize = r * 0.9f; p.textAlign = Paint.Align.CENTER
-                    c.drawText("+", cx, cy + r * 0.3f, p)
+                    c.drawText(if (kind == "media") "\u25B6" else "+", cx, cy + r * 0.3f, p)
                 }
             }
             else -> {
@@ -424,5 +426,76 @@ class AvatarThumb(ctx: Context, val kind: String) : View(ctx) {
         p.strokeWidth = if (chosen) 5f else 2f
         p.color = if (chosen) accent else 0xFF444444.toInt()
         c.drawCircle(cx, cy, r + 2f, p)
+    }
+}
+
+
+/** Full-screen colourful edge glow that jumps with the voice (used over photo / video backgrounds) */
+class GlowView(ctx: Context) : View(ctx) {
+    var accent = 0xFFFF1744.toInt()
+    var active = false
+    private var t = 0f
+    private var amp = 0f
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    override fun onDraw(c: Canvas) {
+        t += 0.016f
+        val target = when {
+            !active -> 0f
+            MyraService.speakingNow -> 0.45f + 0.55f * abs(sin(t * 6f))
+            else -> MyraService.level
+        }
+        amp += (target - amp) * 0.2f
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val th = w * 0.07f * (0.5f + amp * 2.4f)
+        val a = (if (active) 70 + amp * 185 else 45).toInt()
+        for (k in 0 until 4) {
+            val col = hueShift(accent, (t * 70f + k * 80f) % 360f)
+            val c0 = al(col, a)
+            val c1 = al(col, 0)
+            p.shader = when (k) {
+                0 -> LinearGradient(0f, 0f, 0f, th, c0, c1, Shader.TileMode.CLAMP)
+                1 -> LinearGradient(0f, h, 0f, h - th, c0, c1, Shader.TileMode.CLAMP)
+                2 -> LinearGradient(0f, 0f, th, 0f, c0, c1, Shader.TileMode.CLAMP)
+                else -> LinearGradient(w, 0f, w - th, 0f, c0, c1, Shader.TileMode.CLAMP)
+            }
+            when (k) {
+                0 -> c.drawRect(0f, 0f, w, th, p)
+                1 -> c.drawRect(0f, h - th, w, h, p)
+                2 -> c.drawRect(0f, 0f, th, h, p)
+                else -> c.drawRect(w - th, 0f, w, h, p)
+            }
+        }
+        postInvalidateOnAnimation()
+    }
+}
+
+/** Colourful moving background (shown behind a full-screen photo / video) */
+class AuraView(ctx: Context) : View(ctx) {
+    var accent = 0xFFFF1744.toInt()
+    private var t = 0f
+    private var amp = 0f
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    override fun onDraw(c: Canvas) {
+        t += 0.016f
+        val target = if (MyraService.speakingNow) 0.5f + 0.5f * abs(sin(t * 5f)) else MyraService.level
+        amp += (target - amp) * 0.15f
+        c.drawColor(0xFF050505.toInt())
+        val w = width.toFloat()
+        val h = height.toFloat()
+        for (i in 0 until 6) {
+            val ang = t * (0.25f + i * 0.07f) + i * 1.1f
+            val x = w * (0.5f + 0.38f * cos(ang * (1f + i * 0.13f)))
+            val y = h * (0.5f + 0.34f * sin(ang * (0.8f + i * 0.11f)))
+            val r = min(w, h) * (0.55f + 0.28f * amp + 0.08f * sin(t * 2f + i))
+            val col = hueShift(accent, i * 55f + t * 20f)
+            p.reset(); p.isAntiAlias = true
+            p.xfermode = PorterDuffXfermode(PorterDuff.Mode.SCREEN)
+            p.shader = RadialGradient(x, y, r, intArrayOf(al(col, 190), al(col, 0)), null, Shader.TileMode.CLAMP)
+            c.drawCircle(x, y, r, p)
+        }
+        postInvalidateOnAnimation()
     }
 }
